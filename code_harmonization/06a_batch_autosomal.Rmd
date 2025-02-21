@@ -1,0 +1,191 @@
+---
+title: "Batch correct data using Harman"
+author: 
+  - David lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: yeti
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+  library(Harman)
+  library(SummarizedExperiment)
+  library(parallel)
+  library(doParallel)
+})
+
+base_dir <- "~/TBL Dropbox/David Lukacsovich"
+analysis_dir <- file.path(base_dir, "DATASET", "HRS")
+data_dir <- file.path(analysis_dir, "datasets")
+norm_dir <- file.path(data_dir, "normalized")
+batch_dir <- file.path(data_dir, "batch_corrected")
+```
+
+# Define Functions
+
+## Load Data
+
+```{r func_load}
+prepare_dnam_metadata <- function(dnam_data, dataset) {
+  if (dataset == "ADNI") {
+    dnam_data$age_split_by_tertiles <- ntile(dnam_data$age_at_visit, 3)
+  } else if (dataset == "AIBL") {
+    dnam_data$age_split_by_tertiles <- ntile(dnam_data$pred_age_elastic, 3)
+    disease <- dnam_data$disease
+    diagnosis <- ifelse(
+      disease == "Alzheimer's disease", "AD",
+      ifelse(
+        disease == "Mild Cognitive Impairment", "MCI",
+        "CN"
+      )
+    )
+  } else if (dataset == "FHS") {
+    dnam_data$age_split_by_tertiles <- ntile(dnam_data$Age_at_collection, 3)
+    batches <- dnam_data$batch
+    batches <- ifelse(batches == "B0019", "B0018", batches)
+    dnam_data$batch <- batches
+  } else if (dataset == "MESA") {
+    dnam_data$race <- as.character(dnam_data$race1c)
+  }
+  
+  dnam_data
+}
+
+load_data <- function(dataset) {
+  dnam_data <- readRDS(
+    file.path(norm_dir, paste0(dataset, "_Autosomal.RDS"))
+  )
+  
+  dnam_data <- prepare_dnam_metadata(dnam_data, dataset)
+  
+  dnam_data
+}
+```
+
+## Batch Correct
+
+```{r func_batch}
+get_batch_params <- function(
+    dnam_data, batch_var = "batch", expt_vars = c("sex", "DX")
+) {
+  pheno_df <- dnam_data %>%
+    SummarizedExperiment::colData() %>%
+    as.data.frame()
+  
+  batches <- pheno_df %>%
+    dplyr::pull(as.name(batch_var)) %>%
+    as.character()
+  
+  expt <- pheno_df %>%
+    dplyr::pull(as.name(expt_vars[[1]])) %>%
+    as.character()
+  
+  if (length(expt_vars) > 1) {
+    for (expt_var in expt_vars[2:length(expt_vars)]) {
+      expt_add <- pheno_df %>%
+        dplyr::pull(as.name(expt_var)) %>%
+        as.character()
+      expt <- paste0(expt, "_", expt_add)
+    }
+  }
+  
+  expt <- as.factor(expt)
+  batches <- as.factor(batches)
+  
+  list(batch = batches, expt = expt)
+}
+
+batch_data <- function(
+    dnam_data, batch_var = "batch", expt_vars = c("sex", "DX"), randseed = 42
+) {
+  batch_params <- get_batch_params(dnam_data, batch_var = batch_var, expt_vars = expt_vars)
+  batch <- batch_params$batch
+  expt <- batch_params$expt
+  
+  m_data <- SummarizedExperiment::assays(dnam_data)$dnam %>%
+    Harman::shiftBetas(shiftBy = 1e-4) %>%
+    lumi::beta2m()
+  
+  harman_data <- Harman::harman(
+    m_data, expt = expt, batch = batch, limit = 0.95, randseed = randseed
+  )
+  harman_data
+}
+
+reconstruct_data <- function(dnam_data, harman_data) {
+  correct_data <- Harman::reconstructData(harman_data)
+  correct_data <- lumi::m2beta(correct_data)
+  correct_data <- SummarizedExperiment::SummarizedExperiment(
+    assays = list(dnam = correct_data),
+    rowData = dnam_data %>%
+      SummarizedExperiment::rowData(),
+    colData = dnam_data %>%
+      SummarizedExperiment::colData()
+  )
+  
+  correct_data
+}
+```
+
+## Wrapper Function
+
+```{r func_wrapper}
+process_dataset <- function(dataset, expt_vars) {
+  dnam_data <- load_data(dataset)
+  harman_data <- batch_data(
+    dnam_data, batch_var = "batch", expt_vars = expt_vars
+  )
+  
+  saveRDS(
+    harman_data,
+    file.path(batch_dir, paste0(dataset, "_Harman_Result.RDS"))
+  )
+  
+  correct_data <- reconstruct_data(dnam_data, harman_data)
+  
+  saveRDS(
+    correct_data,
+    file.path(batch_dir, paste0(dataset, "_Batched.RDS"))
+  )
+}
+```
+
+# Run
+
+```{r run}
+process_dataset(dataset = "AIBL", expt_vars = "age_split_by_tertiles")
+process_dataset(dataset = "ADNI", expt_vars = "age_split_by_tertiles")
+process_dataset(dataset = "FHS", expt_vars = "age_split_by_tertiles")
+process_dataset(dataset = "MESA", expt_vars = "race")
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

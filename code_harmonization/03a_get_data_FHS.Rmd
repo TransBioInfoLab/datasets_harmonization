@@ -1,0 +1,161 @@
+---
+title: "Read in and HRS NIAGADS DNA methylation data"
+author: 
+  - David lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: yeti
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline    
+---
+
+# Set Up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+  library(tidyr)
+  library(minfi)
+  library(wateRmelon)
+  library(SummarizedExperiment)
+})
+
+base_dir <- "~/TBL Dropbox/David Lukacsovich"
+analysis_dir <- file.path(base_dir, "DATASET", "Framingham")
+raw_dir <- file.path(analysis_dir, "DNAm/raw/EPIC") 
+data_dir <- file.path(analysis_dir, "DNAm/processed/EPIC") 
+```
+
+# Read Data
+
+## Get Phenotype
+
+```{r load_pheno}
+pheno_df <- read.csv(file.path(data_dir, "FHS_Offspring_EPIC_colData.csv")) %>%
+  dplyr::mutate(batch = .data$Batch)
+```
+
+## Get Idat Data
+
+```{r load_idat}
+RGSet <- minfi::read.metharray.exp(
+  base = raw_dir,
+  recursive = TRUE,
+  verbose = FALSE
+)
+RGSet <- RGSet[,pheno_df$sample]
+```
+
+## Create SummarizedExperiment
+
+```{r create_dnam}
+row.names(pheno_df) <- pheno_df$sample
+dnam_data <- SummarizedExperiment::SummarizedExperiment(
+  assays = list(dnam = RGSet),
+  rowData = NULL,
+  colData = pheno_df
+)
+```
+
+# Add Annotation
+
+## Get Bisulfite Scores
+
+```{r pred_bisulfite}
+dnam_data$Bisulfite <- wateRmelon::bscon(
+  SummarizedExperiment::assays(dnam_data)$dnam
+)
+```
+
+## Get Gender Prediction
+
+```{r pred_gender}
+assay_genome <- minfi::mapToGenome(
+  SummarizedExperiment::assays(dnam_data)$dnam
+)
+assay_sex <- minfi::getSex(assay_genome)
+
+dnam_data$sex_predicted <- ifelse(
+  assay_sex$predictedSex %in% c("M", "Male", "MALE"), "MALE", "FEMALE"
+)
+
+dnam_data$sex_match <- ifelse(
+  dnam_data$sex == dnam_data$sex_predicted, "Yes", "No"
+)
+print(table(dnam_data$sex_match))
+```
+
+# Filter Samples
+
+## Identify Samples to Filter
+
+```{r}
+pheno_df <- dnam_data %>%
+  SummarizedExperiment::colData() %>%
+  as.data.frame() %>%
+  dplyr::mutate(
+    Pass_Filter = .data$Bisulfite >= 85 & .data$sex_match == "Yes"
+  )
+dnam_data$Pass_Filter <- pheno_df$Pass_Filter
+print(table(pheno_df$Pass_Filter))
+```
+
+## Save Full Unfiltered Phenotype
+
+```{r}
+pheno_df <- dnam_data %>%
+  SummarizedExperiment::colData() %>%
+  as.data.frame()
+write.csv(
+  pheno_df,
+  file = file.path(data_dir, "DNAm_Data_All_Phenotypes.csv"),
+  row.names = TRUE
+)
+```
+
+## Filter Data
+
+```{r}
+dnam_data <- dnam_data[,dnam_data$Pass_Filter]
+```
+
+# Save
+
+## Save Full
+
+```{r}
+saveRDS(dnam_data, file = file.path(data_dir, "DNAm_Data.RDS"))
+pheno_df <- dnam_data %>%
+  SummarizedExperiment::colData() %>%
+  as.data.frame()
+write.csv(
+  pheno_df,
+  file = file.path(data_dir, "DNAm_Data_Phenotypes.csv"),
+  row.names = TRUE
+)
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

@@ -1,0 +1,251 @@
+---
+title: "Read in and HRS NIAGADS DNA methylation data"
+author: 
+  - David lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: yeti
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline    
+---
+
+# Set Up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+  library(tidyr)
+  library(minfi)
+  library(wateRmelon)
+  library(SummarizedExperiment)
+  library(GEOquery)
+  library(Biobase)
+  library(EpiDISH)
+  
+})
+
+base_dir <- "~/TBL Dropbox/David Lukacsovich"
+analysis_dir <- file.path(base_dir, "DATASET", "AIBL")
+raw_dir <- file.path(analysis_dir, "DNAm/raw/idat") 
+pheno_dir <- file.path(analysis_dir, "DNAm", "raw", "GSE153712")
+data_dir <- file.path(analysis_dir, "DNAm/processed/EPIC") 
+source_dir <- file.path(analysis_dir, "R")
+ref_dir <- file.path(source_dir, "DNAm-based-age-predictor-master")
+
+source(file.path(ref_dir, "pred_adjusted.R"))
+```
+
+# Read Data
+
+## Get Phenotype
+
+```{r load_pheno}
+geo_id <- "GSE153712"
+geo_data <- GEOquery::getGEO(
+  GEO = geo_id,
+  destdir = pheno_dir
+)
+
+pheno_df <- Biobase::pData(
+  geo_data[[paste0(geo_id, "_series_matrix.txt.gz")]]
+) %>%
+  as.data.frame() %>%
+  dplyr::select(
+    sample = "geo_accession",
+    disease = "disease status:ch1",
+    sex = "gender:ch1",
+    tissue = "tissue:ch1",
+    file = "supplementary_file"
+  ) %>%
+  dplyr::mutate(
+    file = sapply(stringr::str_split(.data$file, "/"), tail, 1)
+  )
+
+slide_df <- pheno_df %>%
+  dplyr::select("file") %>%
+  tidyr::separate(.data$file, into = c("sample", "slide", "pos", "junk"), sep = "_") %>%
+  dplyr::mutate(
+    sentrix = paste0(.data$sample, "_", .data$slide, "_", .data$pos),
+    FID = paste0(.data$slide, "_", .data$pos)
+  )
+
+pheno_df <- cbind(pheno_df, slide_df[,c("FID", "slide", "pos", "sentrix")])
+
+batch_df <- read.table(
+  file.path(pheno_dir, "AIBL_xdisorder_DNAm_covariates_MN2020-with-plate.txt"),
+  sep = "\t",
+  header = TRUE
+) %>%
+  dplyr::select(
+    "FID",
+    control = "case.control",
+    pred_age = "pred.age",
+    smoking = "smoking.score",
+    "B",
+    "NK",
+    "CD4T",
+    "CD8T",
+    "Mono",
+    "Neutro",
+    "Eosino",
+    batch = "PLATE"
+  )
+
+pheno_df <- pheno_df %>%
+  dplyr::left_join(batch_df, by = "FID") %>%
+  dplyr::mutate(batch = paste0("Plate_", .data$batch))
+```
+
+## Get Idat Data
+
+```{r load_idat}
+RGSet <- minfi::read.metharray.exp(
+  base = raw_dir,
+  recursive = TRUE,
+  verbose = FALSE
+)
+RGSet <- RGSet[,pheno_df$sentrix]
+colnames(RGSet) <- pheno_df$sample
+```
+
+## Create SummarizedExperiment
+
+```{r create_dnam}
+row.names(pheno_df) <- pheno_df$sample
+dnam_data <- SummarizedExperiment::SummarizedExperiment(
+  assays = list(dnam = RGSet),
+  rowData = NULL,
+  colData = pheno_df
+)
+```
+
+# Add Annotation
+
+## Get Bisulfite Scores
+
+```{r pred_bisulfite}
+dnam_data$Bisulfite <- wateRmelon::bscon(
+  SummarizedExperiment::assays(dnam_data)$dnam
+)
+```
+
+## Get Gender Prediction
+
+```{r pred_gender}
+assay_genome <- minfi::mapToGenome(
+  SummarizedExperiment::assays(dnam_data)$dnam
+)
+assay_sex <- minfi::getSex(assay_genome)
+
+dnam_data$sex_predicted <- ifelse(
+  assay_sex$predictedSex %in% c("M", "Male", "MALE"), "Male", "Female"
+)
+
+dnam_data$sex_match <- ifelse(
+  dnam_data$sex == dnam_data$sex_predicted, "Yes", "No"
+)
+print(table(dnam_data$sex_match))
+```
+
+## Get Age Prediction
+
+```{r pred_age}
+beta_data <- SummarizedExperiment::assays(dnam_data)$dnam %>%
+  minfi::getBeta()
+
+age_df <- predict_age(beta_data, ref_dir)
+dnam_data$pred_age_elastic <- age_df$ent_age
+dnam_data$pred_age_blup <- age_df$blup_age
+```
+
+## Get Celltype Ratios
+
+```{r}
+data(centDHSbloodDMC.m)
+out.l <- EpiDISH::epidish(beta_data, centDHSbloodDMC.m, method = "RPC")
+frac.m <- data.frame(out.l$estF)
+
+dnam_data$B <- frac.m$B
+dnam_data$NK <- frac.m$NK
+dnam_data$CD4T <- frac.m$CD4T
+dnam_data$CD8T <- frac.m$CD8T
+dnam_data$Mono <- frac.m$Mono
+dnam_data$Neutro <- frac.m$Neutro
+dnam_data$Eosino <- frac.m$Eosino
+```
+
+
+# Filter Samples
+
+## Identify Samples to Filter
+
+```{r}
+pheno_df <- dnam_data %>%
+  SummarizedExperiment::colData() %>%
+  as.data.frame() %>%
+  dplyr::mutate(
+    Pass_Filter = .data$Bisulfite >= 85 & .data$sex_match == "Yes"
+  )
+dnam_data$Pass_Filter <- pheno_df$Pass_Filter
+print(table(pheno_df$Pass_Filter))
+```
+
+## Save Full Unfiltered Phenotype
+
+```{r}
+pheno_df <- dnam_data %>%
+  SummarizedExperiment::colData() %>%
+  as.data.frame()
+write.csv(
+  pheno_df,
+  file = file.path(data_dir, "DNAm_Data_All_Phenotypes.csv"),
+  row.names = TRUE
+)
+```
+
+## Filter Data
+
+```{r}
+dnam_data <- dnam_data[,dnam_data$Pass_Filter]
+```
+
+# Save
+
+## Save Full
+
+```{r}
+saveRDS(dnam_data, file = file.path(data_dir, "DNAm_Data.RDS"))
+pheno_df <- dnam_data %>%
+  SummarizedExperiment::colData() %>%
+  as.data.frame()
+write.csv(
+  pheno_df,
+  file = file.path(data_dir, "DNAm_Data_Phenotypes.csv"),
+  row.names = TRUE
+)
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

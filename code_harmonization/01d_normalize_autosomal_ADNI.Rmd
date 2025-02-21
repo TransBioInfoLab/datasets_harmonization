@@ -1,0 +1,205 @@
+---
+title: "Normalize imputed values of autosomal probes"
+subtitle: "We only run BMIQ normalization, without prior quantile normalization"
+author: 
+  - David lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: yeti
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+  library(wateRmelon)
+  library(SummarizedExperiment)
+  library(parallel)
+  library(doParallel)
+})
+
+base_dir <- "~/TBL Dropbox/David Lukacsovich"
+analysis_dir <- file.path(base_dir, "DATASET", "ADNI")
+data_dir <- file.path(analysis_dir, "DNAm/processed/EPIC") 
+save_dir <- file.path(base_dir, "DATASET", "HRS", "datasets", "normalized")
+```
+
+## Load Data
+
+```{r load}
+dnam_data <- readRDS(file.path(data_dir, "Imputed_Autosomal.RDS"))
+probe_df <- dnam_data %>%
+  SummarizedExperiment::rowData() %>%
+  as.data.frame()
+pheno_df <- dnam_data %>%
+  SummarizedExperiment::colData() %>%
+  as.data.frame()
+beta_data <- SummarizedExperiment::assays(dnam_data)$dnam
+```
+
+# Run BMIQ Normalization
+
+## Define Functions
+
+```{r norm_func}
+start_parallel <- function(parallel, cores) {
+  if (parallel &&
+      requireNamespace("doParallel", quietly = TRUE) &&
+      requireNamespace("parallel", quietly = TRUE)) {
+    if (Sys.info()["sysname"] == "Windows"){
+      cluster <- parallel::makeCluster(cores)
+      doParallel::registerDoParallel(cluster)
+    } else {
+      doParallel::registerDoParallel(cores)
+    }
+  } else {
+    parallel = FALSE
+  }
+
+  parallel
+}
+
+stop_parallel <- function(parallel) {
+  if (parallel &&
+      requireNamespace("doParallel", quietly = TRUE) &&
+      requireNamespace("parallel", quietly = TRUE)) {
+    doParallel::stopImplicitCluster()
+  }
+
+  TRUE
+}
+
+run_bmiq <- function(assay_data, probe_df, seed = 42, cores = 16) {
+  samples <- colnames(assay_data)
+  probes <- row.names(assay_data)
+  type12 <- ifelse(probe_df$type12 == "I", 1, 2)
+  if (length(samples) == 1) {
+    extra_data <- assay_data
+    colnames(extra_data) <- paste0("Extra_", colnames(assay_data))
+    assay_data <- cbind(assay_data, extra_data)
+  }
+  
+  do_parallel <- start_parallel(TRUE, cores)
+  
+  suppressMessages({
+    assay_data <- plyr::aaply(
+      assay_data, 2,
+      function(x){
+        set.seed(seed)
+        norm_ls <- wateRmelon::BMIQ(
+          beta.v = x,
+          design.v = type12,
+          plots = FALSE,
+          pri = FALSE,
+          nfit = 50000
+        )
+        return (norm_ls$nbeta)
+      },.progress = "time", .parallel = do_parallel
+    )
+  })
+
+  stop_parallel(do_parallel)
+  
+  assay_data <- t(assay_data)
+  if (length(samples) == 1) {
+    assay_data <- assay_data[,1,drop = FALSE]
+  }
+  colnames(assay_data) <- samples
+  row.names(assay_data) <- probes
+  
+  assay_data
+}
+
+multistep_bmiq <- function(
+    beta_data, probe_df, seeds = c(1, 2, 4, 8, 16, 32), cores = 16
+) {
+  result_data <- beta_data
+  
+  targets <- colnames(beta_data)
+  
+  for (seed in seeds) {
+    if (length(targets) > 0) {
+      print(sprintf("Start Seed: %d", seed))
+      print(Sys.time())
+      normed <- run_bmiq(
+        assay_data = beta_data[,targets, drop = FALSE],
+        probe_df = probe_df,
+        seed = seed,
+        cores = cores
+      )
+      
+      missing_count <- colSums(is.na(normed))
+      missing <- sum(missing_count > 0)
+      
+      print(sprintf("Samples: %d, Missing: %d", length(targets), missing))
+      print(Sys.time())
+      
+      for (target in targets) {
+        result_data[,target] <- normed[,target]
+      }
+      
+      targets <- names(missing_count)[missing_count > 0]
+    }
+  }
+  
+  beta_data
+}
+```
+
+## Run BMIQ
+
+```{r bmiq_run}
+beta_data <- multistep_bmiq(
+  beta_data,
+  probe_df,
+  seeds = c(1, 2, 4, 8, 16, 32, 64),
+  cores = 16
+)
+```
+
+# Save
+
+## Create SE
+
+```{r save_se}
+dnam_data <- SummarizedExperiment::SummarizedExperiment(
+  assays = list(dnam = beta_data),
+  rowData = probe_df,
+  colData = pheno_df
+)
+```
+
+## Save
+
+```{r save_save}
+saveRDS(dnam_data, file.path(save_dir, "ADNI_Autosomal.RDS"))
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>
+

@@ -1,0 +1,275 @@
+---
+title: "Read in HRS NIAGADS data, get detection P scores, filter out unwanted probes, and convert to beta values"
+author: 
+  - David lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: yeti
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+  library(tidyr)
+  library(minfi)
+  library(DMRcate)
+  library(SummarizedExperiment)
+})
+
+base_dir <- "~/TBL Dropbox/David Lukacsovich"
+analysis_dir <- file.path(base_dir, "DATASET", "HRS")
+raw_dir <- file.path(analysis_dir, "DNAm", "raw")
+data_dir <- file.path(analysis_dir, "DNAm", "preprocessing")
+ref_dir <- file.path(analysis_dir, "DNAm", "ref_files")
+code_dir <- file.path(analysis_dir, "R")
+
+source(file.path(code_dir, "run_parallel.R"), local = TRUE)
+source(file.path(code_dir, "detectionp_functions.R"), local = TRUE)
+```
+
+## Read Data
+
+```{r load_data}
+dnam_data <- readRDS(file.path(raw_dir, "DNAm_Data.RDS"))
+```
+
+# detectionP
+
+## Get detectionP scores
+
+```{r detection_p}
+assay_data <- SummarizedExperiment::assays(dnam_data)$dnam
+detp_df <- data.frame(
+  sample = character(),
+  cpg = character()
+)
+
+for (plate in unique(dnam_data$Sample_Plate)) {
+  print(paste0("detectionP on : ", plate))
+  detp_df <- rbind(
+    detp_df,
+    detectionp_plate(dnam_data, plate, threshold = 0.01)
+  )
+}
+```
+
+## Get Probe Annotation
+
+```{r get_annot}
+anno_df <- read.csv(
+  file.path(ref_dir, "infinium-methylationepic-v-1-0-b5-manifest-file.csv"),
+  skip = 7
+) %>%
+  dplyr::select(
+    "Name",
+    seqnames = "CHR_hg38",
+    pos = "Start_hg38",
+    Relation_to_Island = "Relation_to_UCSC_CpG_Island",
+    "UCSC_RefGene_Name",
+    "UCSC_RefGene_Group",
+    type12 = "Infinium_Design_Type"
+  ) %>%
+  dplyr::filter(
+    (!is.na(.data$pos)) & (nchar(.data$type12) > 0)
+  ) %>%
+  dplyr::filter(.data$seqnames != "chrM")
+
+row.names(anno_df) <- anno_df$Name
+```
+
+## Convert to beta values
+
+```{r convert_beta}
+assay_data <- minfi::getBeta(assay_data)
+assay_data <- assay_data[row.names(assay_data) %in% row.names(anno_df),]
+anno_df <- anno_df[row.names(assay_data),]
+
+pheno_df <- dnam_data %>%
+  SummarizedExperiment::colData() %>%
+  as.data.frame()
+dnam_data <- SummarizedExperiment::SummarizedExperiment(
+  assays = list(dnam = assay_data),
+  rowData = anno_df,
+  colData = pheno_df
+)
+```
+
+# Probe Filtering
+
+## Filter to Probes Starting with 'cg'
+
+```{r filter_cg}
+dnam_data <- dnam_data[grep("cg", row.names(assay_data)), ]
+```
+
+## Filter Probes by SNP distance, cross hybridization
+
+```{r filter_snp}
+assay_data <- SummarizedExperiment::assays(dnam_data)$dnam
+
+assay_data <- DMRcate::rmSNPandCH(
+  assay_data,
+  dist = 5,
+  mafcut = 0.01,
+  and = TRUE,
+  rmcrosshyb = TRUE,
+  rmXY = FALSE
+)
+
+row_df <- dnam_data %>%
+  SummarizedExperiment::rowData() %>%
+  as.data.frame() %>%
+  dplyr::mutate(filter_snp = !(.data$Name %in% row.names(assay_data))) %>%
+  dplyr::mutate(filter_xy = .data$seqnames %in% c("chrX", "chrY"))
+```
+
+## Relabel Rows
+
+```{r se_final}
+assay_data <- SummarizedExperiment::assays(dnam_data)$dnam
+pheno_df <- dnam_data %>%
+  SummarizedExperiment::colData() %>%
+  as.data.frame()
+dnam_data <- SummarizedExperiment::SummarizedExperiment(
+  assays = list(dnam = assay_data),
+  rowData = row_df,
+  colData = pheno_df
+)
+```
+
+## Filter detection P probes
+
+Some of the probes are missing from the probe annotation file. We filter those out, so they also need to be filtered out from the detectionP results
+
+```{r filter_detp}
+detp_df <- detp_df %>%
+  dplyr::filter(.data$cpg %in% row.names(dnam_data))
+```
+
+# Get NA Probes
+
+## Filter to Probes and Samples with NAs
+
+```{r adjust_na}
+na_data <- is.na(assay_data)
+row_counts <- rowSums(na_data)
+na_data <- na_data[row_counts > 0,]
+col_counts <- colSums(na_data)
+na_data <- na_data[,col_counts > 0]
+```
+
+## Get NA dataframe
+
+```{r data_na}
+na_df <- which(na_data, arr.ind = TRUE) %>%
+  as.data.frame()
+
+inds <- cbind(na_df$row, na_df$col)
+
+cpg_df <- data.frame(
+  row = 1:nrow(na_data),
+  cpg = row.names(na_data)
+)
+
+sample_df <- data.frame(
+  col = 1:ncol(na_data),
+  sample = colnames(na_data)
+)
+
+na_df <- na_df %>%
+  dplyr::left_join(cpg_df, by = "row") %>%
+  dplyr::left_join(sample_df, by = "col") %>%
+  dplyr::select("sample", "cpg")
+```
+
+# Filter High Missing Samples
+
+We filter out any samples that have at least 5% of their non-XY probes with high detection P values
+
+## Get Counts
+
+```{r sample_filter_detp}
+base_probes <- row_df %>%
+  dplyr::filter(!.data$filter_xy) %>%
+  dplyr::pull("Name")
+
+base_df <- detp_df %>%
+  dplyr::filter(.data$cpg %in% base_probes) %>%
+  dplyr::group_by(.data$sample) %>%
+  dplyr::summarise(missing_count = n()) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    to_filter = .data$missing_count >= 0.05 * length(base_probes)
+  )
+
+to_drop <- base_df %>%
+  dplyr::filter(.data$to_filter) %>%
+  dplyr::pull("sample")
+
+dnam_data <- dnam_data[,!(dnam_data$IDATid %in% to_drop)]
+na_df <- na_df %>%
+  dplyr::filter(!(.data$sample %in% to_drop))
+detp_df <- detp_df %>%
+  dplyr::filter(!(.data$sample %in% to_drop))
+```
+
+# Save Results
+
+```{r save}
+saveRDS(dnam_data, file = file.path(data_dir, "Preprocessed_Beta.RDS"))
+write.csv(
+  detp_df,
+  file = file.path(data_dir, "detectionP_Failures.csv"),
+  row.names = FALSE
+)
+write.csv(
+  na_df,
+  file = file.path(data_dir, "missing_probes.csv"),
+  row.names = FALSE
+)
+row_df <- dnam_data %>%
+  SummarizedExperiment::rowData() %>%
+  as.data.frame()
+pheno_df <- dnam_data %>%
+  SummarizedExperiment::colData() %>%
+  as.data.frame()
+write.csv(
+  row_df,
+  file = file.path(data_dir, "Preprocssed_Probes.csv"),
+  row.names = TRUE
+)
+write.csv(
+  pheno_df,
+  file = file.path(data_dir, "Preprocssed_Metadata.csv"),
+  row.names = TRUE
+)
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

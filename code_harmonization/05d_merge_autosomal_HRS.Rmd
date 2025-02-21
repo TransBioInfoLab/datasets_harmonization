@@ -1,0 +1,236 @@
+---
+title: "Merge imputed batches, and re-impute probes with detectionP < 0.01 in < 10 samples in a batch"
+subtitle: "Look at autosomal probes"
+author: 
+  - David lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: yeti
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+  library(methyLImp2)
+})
+
+base_dir <- "~/TBL Dropbox/David Lukacsovich"
+analysis_dir <- file.path(base_dir, "DATASET", "HRS")
+raw_dir <- file.path(analysis_dir, "DNAm", "raw")
+data_dir <- file.path(analysis_dir, "DNAm", "preprocessing")
+ref_dir <- file.path(analysis_dir, "DNAm", "ref_files")
+result_dir <- file.path(analysis_dir, "analysis_results")
+save_dir <- file.path(analysis_dir, "DNAm", "imputed")
+```
+
+# Load Data
+
+## Define Functions
+
+```{r load_func}
+load_batch <- function(batch) {
+  dnam_data <- readRDS(
+    file.path(
+      save_dir,
+      sprintf("Imputed_Autosomal_%02d.RDS", batch)
+    )
+  )
+  
+  beta_data <- SummarizedExperiment::assays(dnam_data)$dnam
+  
+  beta_data
+}
+
+load_batches <- function(batches) {
+  beta_ls <- vector(mode = "list", length = length(batches))
+  
+  for (index in 1:length(batches)) {
+    batch <- batches[[index]]
+    beta_ls[[index]] <- load_batch(batch)
+  }
+  
+  beta_data <- do.call(cbind, beta_ls)
+  
+  beta_data
+}
+
+get_batch_summaries <- function(detp_df, pheno_df) {
+  missing_df <- detp_df %>%
+    dplyr::select("cpg", "batch") %>%
+    dplyr::group_by(.data$batch, .data$cpg) %>%
+    dplyr::summarise(missing_count = n()) %>%
+    dplyr::ungroup()
+  
+  count_df <- pheno_df %>%
+    dplyr::group_by(.data$batch) %>%
+    dplyr::summarise(total_count = n()) %>%
+    dplyr::ungroup()
+  
+  batch_df <- missing_df %>%
+    dplyr::left_join(count_df, by = "batch") %>%
+    dplyr::mutate(
+      present_count = .data$total_count - .data$missing_count,
+      label = paste0(.data$batch, "_", .data$cpg)
+    ) %>%
+    dplyr::select(
+      "cpg", "batch", "label", "total_count", "present_count", "missing_count"
+    )
+  
+  batch_df
+}
+
+get_na_targets <- function(pheno_df) {
+  detp_df <- read.csv(file.path(data_dir, "detectionP_Failures.csv")) %>%
+    dplyr::filter(.data$cpg %in% probe_df$Name) %>%
+    dplyr::filter(.data$sample %in% pheno_df$IDATid) %>%
+    dplyr::filter(.data$detp >= 0.01) %>%
+    dplyr::left_join(
+      pheno_df %>% dplyr::select(sample = "IDATid", "batch"),
+      by = "sample"
+    ) %>%
+    dplyr::select("cpg", "sample", "batch") %>%
+    dplyr::mutate(label = paste0(.data$batch, "_", .data$cpg))
+  
+  print(dim(detp_df))
+  
+  batch_df <- get_batch_summaries(detp_df, pheno_df) %>%
+    dplyr::filter(.data$present_count < 10)
+  
+  detp_df <- detp_df %>%
+    dplyr::filter(.data$label %in% batch_df$label) %>%
+    dplyr::select("cpg", "sample")
+  
+  print(dim(detp_df))
+  
+  detp_df
+}
+```
+
+## Get Annotations
+
+```{r load_annot}
+probe_df <- read.csv(file.path(data_dir, "Preprocssed_Probes.csv")) %>%
+  as.data.frame() %>%
+  tibble::column_to_rownames("X")
+
+pheno_df <- read.csv(file.path(data_dir, "Preprocssed_Metadata.csv")) %>%
+  as.data.frame() %>%
+  tibble::column_to_rownames("X") %>%
+  dplyr::mutate(
+    batch = ifelse(
+      .data$Sample_Plate == "Thyagarajan_Sample_144",
+      "Thyagarajan_Sample_143",
+      .data$Sample_Plate
+    )
+  )
+detp_df <- get_na_targets(pheno_df)
+```
+
+## Get Beta Values
+
+```{r load_batch}
+batches <- 1:24
+beta_data <- load_batches(batches)
+```
+
+## Filter Annotations
+
+```{r load_filter}
+probe_df <- probe_df[row.names(beta_data),]
+pheno_df <- pheno_df[colnames(beta_data),]
+detp_df <- detp_df %>%
+  dplyr::filter(.data$cpg %in% row.names(beta_data))
+```
+
+# Impute Probes
+
+## Set Missing
+
+```{r impute_set_na}
+beta_data <- beta_data %>%
+  t()
+
+samples <- row.names(beta_data)
+probes <- colnames(beta_data)
+
+detp_df <- detp_df %>%
+  dplyr::filter(.data$sample %in% samples) %>%
+  dplyr::filter(.data$cpg %in% probes)
+
+for (Sample in unique(detp_df$sample)) {
+  cpgs <- detp_df %>%
+    dplyr::filter(.data$sample == Sample) %>%
+    dplyr::pull("cpg")
+  
+  beta_data[Sample, cpgs] <- NA
+}
+```
+
+## Run Impute
+
+```{r impute_run}
+samples <- row.names(beta_data)
+probes <- colnames(beta_data)
+
+beta_data <- methyLImp2::methyLImp2(
+  beta_data,
+  type = "user",
+  annotation = probe_df %>% dplyr::select(cpg = "Name", chr = "seqnames"),
+  BPPARAM = BiocParallel::SnowParam(workers = 22, exportglobals = FALSE),
+  groups = NULL,
+  overwrite_res = FALSE,
+  minibatch_frac = 0.20,
+  minibatch_reps = 3
+)
+
+colnames(beta_data) <- probes
+row.names(beta_data) <- samples
+```
+
+# Save
+
+## Create SE
+
+```{r save_se}
+dnam_data <- SummarizedExperiment::SummarizedExperiment(
+  assays = list(dnam = t(beta_data)),
+  rowData = probe_df,
+  colData = pheno_df
+)
+```
+
+## Save
+
+```{r save_save}
+saveRDS(dnam_data, file.path(save_dir, "Imputed_Autosomal.RDS"))
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>
+

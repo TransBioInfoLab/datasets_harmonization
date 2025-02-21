@@ -1,0 +1,228 @@
+---
+title: "Read in and HRS NIAGADS DNA methylation data"
+author: 
+  - David lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: yeti
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline    
+---
+
+# Set Up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+  library(tidyr)
+  library(minfi)
+  library(wateRmelon)
+  library(SummarizedExperiment)
+  library(readxl)
+})
+
+base_dir <- "~/TBL Dropbox/David Lukacsovich"
+analysis_dir <- file.path(base_dir, "DATASET", "ADNI")
+raw_dir <- file.path(analysis_dir, "DNAm/raw/idat") 
+pheno_dir <- file.path(analysis_dir, "Phenotype", "raw")
+rep_dir <- file.path(analysis_dir, "Phenotype", "processed")
+data_dir <- file.path(analysis_dir, "DNAm/processed/EPIC") 
+```
+
+# Read Data
+
+## Get Phenotype
+
+```{r load_pheno}
+pheno_df <- readxl::read_excel(
+  file.path(pheno_dir, "ADNI_DNA_Methylation_SampleAnnotation_20170530.xlsx")
+) %>%
+  dplyr::mutate(sample = .data$barcodes) %>%
+  dplyr::rename(batch = "PlateNumber") %>%
+  dplyr::mutate(ID = paste0(.data$RID, "_", .data$Phase, "_", .data$Edate))
+
+meta_df <- read.csv(
+  file.path(
+    rep_dir,
+    "ADNI_DNA_Methylation_SampleAnnotation_20170530_with_bs.csv"
+  )
+) %>%
+  dplyr::filter(!is.na(.data$Slide)) %>%
+  dplyr::filter(!.data$is_replicate) 
+
+clinical_df <- read.csv(file.path(pheno_dir, "ADNIMERGE_downloaded_3-1-2021.csv")) %>%
+  dplyr::mutate(
+    ID = paste0(.data$RID, "_", .data$COLPROT, "_", .data$EXAMDATE)
+  ) %>%
+  dplyr::select(
+    "ID",
+    "AGE",
+    sex = "PTGENDER",
+    Ethnicity = "PTETHCAT",
+    Race = "PTRACCAT",
+    "APOE4",
+    "DX"
+  ) %>%
+  dplyr::distinct()
+
+demo_df <- read.csv(file.path(pheno_dir,"PTDEMOG_3-1-2021.csv")) %>%
+  dplyr::select("RID", birth_month = "PTDOBMM", birth_year = "PTDOBYY") %>%
+  dplyr::distinct() %>%
+  dplyr::filter(!is.na(.data$birth_month))
+
+pheno_df <- pheno_df %>%
+  dplyr::filter(.data$barcodes %in% meta_df$barcodes) %>%
+  dplyr::left_join(demo_df, by = "RID") %>%
+  dplyr::left_join(clinical_df, by = "ID") %>%
+  dplyr::mutate(
+    age_at_visit = lubridate::interval(
+      as.Date(paste0(.data$birth_month,"/1/",.data$birth_year), "%m/%d/%Y"),
+      .data$DateDrawn
+    ) %>%
+      lubridate::time_length(unit = "years")
+  ) %>%
+  as.data.frame()
+```
+
+## Get Idat Data
+
+```{r load_idat}
+RGSet <- minfi::read.metharray.exp(
+  base = raw_dir,
+  recursive = TRUE,
+  verbose = FALSE
+)
+RGSet <- RGSet[,pheno_df$sample]
+```
+
+## Create SummarizedExperiment
+
+```{r create_dnam}
+row.names(pheno_df) <- pheno_df$sample
+dnam_data <- SummarizedExperiment::SummarizedExperiment(
+  assays = list(dnam = RGSet),
+  rowData = NULL,
+  colData = pheno_df
+)
+```
+
+# Add Annotation
+
+## Get Bisulfite Scores
+
+```{r pred_bisulfite}
+dnam_data$Bisulfite <- wateRmelon::bscon(
+  SummarizedExperiment::assays(dnam_data)$dnam
+)
+```
+
+## Get Gender Prediction
+
+```{r pred_gender}
+assay_genome <- minfi::mapToGenome(
+  SummarizedExperiment::assays(dnam_data)$dnam
+)
+assay_sex <- minfi::getSex(assay_genome)
+
+dnam_data$sex_predicted <- ifelse(
+  assay_sex$predictedSex %in% c("M", "Male", "MALE"), "Male", "Female"
+)
+
+dnam_data$sex_match <- ifelse(
+  dnam_data$sex == dnam_data$sex_predicted, "Yes", "No"
+)
+
+pheno_df <- dnam_data %>%
+  SummarizedExperiment::colData() %>%
+  as.data.frame()
+
+print(paste0("Total Patients: ", length(unique(pheno_df$RID))))
+pheno_df <- pheno_df %>%
+  dplyr::filter(.data$sex_match == "Yes")
+print(paste0("Correctly Predicted Patients: ", length(unique(pheno_df$RID))))
+```
+
+# Filter Samples
+
+## Identify Samples to Filter
+
+```{r}
+pheno_df <- dnam_data %>%
+  SummarizedExperiment::colData() %>%
+  as.data.frame() %>%
+  dplyr::mutate(
+    Pass_Filter = .data$Bisulfite >= 85 & .data$sex_match == "Yes"
+  )
+dnam_data$Pass_Filter <- pheno_df$Pass_Filter
+pheno_df <- dnam_data %>%
+  SummarizedExperiment::colData() %>%
+  as.data.frame() %>%
+  dplyr::filter(.data$Pass_Filter)
+print(paste0("Passed Filtering Patients: ", length(unique(pheno_df$RID))))
+```
+
+## Save Full Unfiltered Phenotype
+
+```{r}
+pheno_df <- dnam_data %>%
+  SummarizedExperiment::colData() %>%
+  as.data.frame()
+write.csv(
+  pheno_df,
+  file = file.path(data_dir, "DNAm_Data_All_Phenotypes.csv"),
+  row.names = TRUE
+)
+```
+
+## Filter Data
+
+```{r}
+pheno_df <- dnam_data %>%
+  SummarizedExperiment::colData() %>%
+  as.data.frame() %>%
+  dplyr::filter(.data$Pass_Filter) %>%
+  dplyr::arrange(.data$age_at_visit) %>%
+  dplyr::distinct(.data$RID, .keep_all = TRUE)
+dnam_data <- dnam_data[,pheno_df$sample]
+```
+
+# Save
+
+## Save Full
+
+```{r}
+saveRDS(dnam_data, file = file.path(data_dir, "DNAm_Data.RDS"))
+pheno_df <- dnam_data %>%
+  SummarizedExperiment::colData() %>%
+  as.data.frame()
+write.csv(
+  pheno_df,
+  file = file.path(data_dir, "DNAm_Data_Phenotypes.csv"),
+  row.names = TRUE
+)
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>
