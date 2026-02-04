@@ -1,0 +1,159 @@
+---
+title: "Use PCAs to filter out outliers"
+author: 
+  - David lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: yeti
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+  library(irlba)
+  library(SummarizedExperiment)
+  library(parallel)
+  library(doParallel)
+})
+
+base_dir <- "../../.."
+analysis_dir <- file.path(base_dir, "DATASET", "_HARMONIZATION")
+code_dir <- file.path(analysis_dir, "R")
+data_dir <- file.path(analysis_dir, "data_CN_only/preprocessing/MESA")
+submit_dir <- file.path(analysis_dir, "data_CN_only/submission/MESA")
+
+source(file.path(code_dir, "run_pca.R"), local = TRUE)
+```
+
+# Define Functions
+
+## Load and Save Data
+
+```{r func_load}
+load_data <- function(dataset) {
+  dnam_data <- readRDS(file.path(data_dir, "DNAm_batched.RDS"))
+  
+  dnam_data
+}
+
+save_data <- function(dnam_data, dataset) {
+  saveRDS(
+    dnam_data,
+    file = file.path(data_dir, "DNAm_pca.RDS")
+  )
+  
+  exp_data <- SummarizedExperiment::assays(dnam_data)$dnam %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column(var = "CpG")
+  write.table(
+    x = exp_data,
+    file = file.path(submit_dir, paste0(dataset, "_harmonized.tsv")),
+    quote = FALSE,
+    sep = "\t",
+    row.names = FALSE,
+    col.names = TRUE
+  )
+}
+```
+
+## Wrapper Function
+
+```{r func_wrapper}
+analyze_dataset <- function(dataset) {
+  dnam_data <- load_data(dataset)
+  pca_res <- process_dataset(
+    dnam_data,
+    outlier_cutoff = 3,
+    pc_count = 5,
+    pc_label = "PC_",
+    outlier_label = "is_outlier",
+    filter_outlier = FALSE
+  )
+  dnam_data <- pca_res$dnam_data
+  pca_df <- pca_res$pca_df
+  percentVar <- pca_res$percentVar
+  pca_params <- pca_res$pca_params
+  
+  save_data(dnam_data, dataset)
+  
+  list(pca_df = pca_df, percentVar = percentVar, pca_params = pca_params)
+}
+
+plot_dataset <- function(
+    label, pca_df, percentVar, pca_params, plot_vars, outlier_cutoff = 3
+) {
+  message(
+    "In ",
+    label,
+    " there are a total of ",
+    sum(pca_df$is_outlier),
+    " outliers out of ", 
+    nrow(pca_df),
+    " samples"
+  )
+  
+  for (plot_var in plot_vars) {
+    pca_df[,plot_var] <- as.character(pca_df[,plot_var])
+    p <- plot_pca(
+      pca_df,
+      label,
+      plot_var,
+      percentVar,
+      pca_params,
+      outlier_cutoff,
+      pc_label = "PC_",
+      outlier_label = "is_outlier"
+    )
+    
+    print(p)
+  }
+}
+
+analyze_plot_dataset <- function(dataset) {
+  plot_vars <- c("age_split_by_tertiles", "Sex")
+  
+  res_ls <- analyze_dataset(dataset)
+  pca_df <- res_ls$pca_df
+  percentVar <- res_ls$percentVar
+  pca_params <- res_ls$pca_params
+  
+  plot_dataset(
+    dataset, pca_df, percentVar, pca_params, plot_vars, outlier_cutoff = 3
+  )
+}
+```
+
+# Run
+
+```{r run}
+analyze_plot_dataset("MESA")
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

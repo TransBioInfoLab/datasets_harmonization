@@ -1,0 +1,180 @@
+---
+title: "Read in Framingham DNA methylation data"
+author: 
+  - David lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: yeti
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline    
+---
+
+# Set Up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Libraries
+
+```{r library}
+suppressMessages({                                                                 # Suppress startup messages for cleaner logs
+  library(dplyr)                                                                   # Load dplyr for data manipulation
+  library(tidyr)                                                                   # Load tidyr for data reshaping
+  library(minfi)                                                                   # Load minfi for DNA methylation array processing
+  library(wateRmelon)                                                              # Load wateRmelon for bisulfite conversion metrics
+  library(SummarizedExperiment)                                                    # Load SummarizedExperiment for container objects
+})                                                                                 # End suppressed library loading block
+
+base_dir <- "../../.."                                                             # Define project base directory relative to script location
+analysis_dir <- file.path(base_dir, "DATASET", "Framingham")                       # Define Framingham analysis directory
+raw_dir <- file.path(analysis_dir, "DNAm/raw/EPIC")                                # Define directory containing raw EPIC IDAT files
+harmony_dir <- file.path(base_dir, "DATASET/_HARMONIZATION/data_CN_only")          # Define harmonization data directory
+data_dir <- file.path(harmony_dir, "preprocessing/FHS")                            # Define directory for processed Framingham data
+```
+
+# Read Data
+
+## Get Phenotype
+
+```{r load_pheno}
+pheno_df <- read.csv(file.path(data_dir, "phenotype_all.csv"))                     # Read in full phenotype metadata table
+```
+
+## Get Idat Data
+
+```{r load_idat}
+RGSet <- minfi::read.metharray.exp(                                                # Read raw IDAT files into an RGChannelSet
+  base = raw_dir,                                                                  # Specify base directory containing IDATs
+  recursive = TRUE,                                                                # Search subdirectories recursively
+  verbose = FALSE                                                                  # Suppress verbose read output
+)                                                                                  # End IDAT import call
+
+
+pheno_df <- pheno_df %>%                                                           # Begin phenotype filtering pipeline
+  dplyr::filter(.data$idat_label %in% colnames(RGSet))                             # Keep only samples with matching IDATs
+
+RGSet <- RGSet[, pheno_df$idat_label]                                              # Subset RGSet to phenotype-matched samples only
+colnames(RGSet) <- pheno_df$sample                                                 # Rename RGSet columns to human-readable sample IDs
+```
+
+## Create SummarizedExperiment
+
+```{r create_dnam}
+row.names(pheno_df) <- pheno_df$sample                                             # Set row names of phenotype table to sample IDs
+dnam_data <- SummarizedExperiment::SummarizedExperiment(                           # Create a SummarizedExperiment object
+  assays = list(dnam = RGSet),                                                     # Store raw methylation data as an assay
+  rowData = NULL,                                                                  # Do not include probe-level metadata
+  colData = pheno_df                                                               # Attach phenotype data as column metadata
+)                                                                                  # End SummarizedExperiment construction
+```
+
+# Add Annotation
+
+## Get Bisulfite Scores
+
+```{r pred_bisulfite}
+dnam_data$Bisulfite <- wateRmelon::bscon(                                          # Calculate bisulfite conversion efficiency
+  SummarizedExperiment::assays(dnam_data)$dnam                                     # Use raw methylation assay as input
+)                                                                                  # Store bisulfite conversion metric per sample
+```
+
+## Get Gender Prediction
+
+```{r pred_gender}
+assay_genome <- minfi::mapToGenome(                                                # Map probes to the genome
+  SummarizedExperiment::assays(dnam_data)$dnam                                     # Use raw methylation data
+)                                                                                  # End genome mapping
+
+assay_sex <- minfi::getSex(assay_genome)                                           # Predict biological sex from methylation patterns
+
+dnam_data$Sex_predicted <- ifelse(                                                 # Create standardized predicted sex variable
+  assay_sex$predictedSex %in% c("M", "Male", "MALE"),                              # Treat all male labels equivalently
+  "MALE",                                                                          # Assign MALE if prediction is male
+  "FEMALE"                                                                         # Otherwise assign FEMALE
+)                                                                                  # End sex prediction standardization
+
+dnam_data$Sex_match <- ifelse(                                                     # Compare reported vs predicted sex
+  (!is.na(dnam_data$Sex)) &                                                        # Require non-missing reported sex
+    (dnam_data$Sex == dnam_data$Sex_predicted),                                    # Check if reported equals predicted
+  "Yes",                                                                           # Mark match as Yes
+  "No"                                                                             # Mark mismatch as No
+)                                                                                  # End sex concordance check
+
+print(table(dnam_data$Sex_match))                                                  # Display counts of sex matches vs mismatches
+```
+
+# Filter Samples
+
+## Identify Samples to Filter
+
+```{r find_filter}
+
+pheno_df <- dnam_data %>%                                                          # Extract updated phenotype data
+  SummarizedExperiment::colData() %>%                                              # Pull column metadata from SummarizedExperiment
+  as.data.frame() %>%                                                              # Convert to standard data frame
+  dplyr::mutate(                                                                   # Add QC pass/fail flag
+    Pass_Filter = .data$Bisulfite >= 85 &                                          # Require bisulfite conversion ≥ 85%
+      .data$Sex_match == "Yes"                                                     # Require sex concordance
+  )                                                                                # End QC flag definition
+
+dnam_data$Pass_Filter <- pheno_df$Pass_Filter                                      # Store QC flag back into SummarizedExperiment
+print(table(pheno_df$Pass_Filter))                                                 # Display number of samples passing vs failing QC
+```
+
+## Save Full Unfiltered Phenotype
+
+```{r save_pheno}
+pheno_df <- dnam_data %>%                                                          # Re-extract phenotype metadata
+  SummarizedExperiment::colData() %>%                                              # Pull column metadata again
+  as.data.frame()                                                                  # Convert to data frame
+
+write.csv(                                                                         # Write phenotype table with QC parameters
+  pheno_df,                                                                        # Data frame to write
+  file = file.path(data_dir, "phenotypes_filter_params.csv"),                      # Output file path
+  row.names = TRUE                                                                 # Preserve sample IDs as row names
+)                                                                                  # End CSV export
+```
+
+## Filter Data
+
+```{r filter}
+dnam_data <- dnam_data[, dnam_data$Pass_Filter]                                    # Subset to samples passing QC only
+```
+
+# Save
+
+## Save Full
+
+```{r save}
+saveRDS(dnam_data, file = file.path(data_dir, "DNAm_data.RDS"))                    # Save filtered DNAm object as RDS
+
+pheno_df <- dnam_data %>%                                                          # Extract final filtered phenotype data
+  SummarizedExperiment::colData() %>%                                              # Pull column metadata
+  as.data.frame()                                                                  # Convert to data frame
+
+write.csv(                                                                         # Write filtered phenotype table
+  pheno_df,                                                                        # Data frame to write
+  file = file.path(data_dir, "phenotype_filtered.csv"),                            # Output file path
+  row.names = TRUE                                                                 # Preserve sample IDs
+)                                                                                  # End CSV export
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()                                                                   # Print session/package versions for reproducibility
+```
+</details>

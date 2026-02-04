@@ -1,0 +1,288 @@
+          ---
+title: "Read in FHS data, get detection P scores, filter out unwanted probes, and convert to beta values"
+author: 
+  - David lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: yeti
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({                                                              # Suppress startup messages for cleaner logs
+  library(dplyr)                                                                # Load dplyr for data manipulation
+  library(tidyr)                                                                # Load tidyr for tidy data operations
+  library(minfi)                                                                # Load minfi for methylation array processing
+  library(DMRcate)                                                              # Load DMRcate for SNP and cross-hybridization filtering
+  library(SummarizedExperiment)                                                 # Load SummarizedExperiment container infrastructure
+})                                                                              # End suppressed library loading block
+
+base_dir <- "../../.."                                                          # Define project base directory relative to script location
+analysis_dir <- file.path(base_dir, "DATASET", "_HARMONIZATION")                # Define harmonization analysis directory
+code_dir <- file.path(analysis_dir, "R")                                        # Define directory containing helper R scripts
+ref_dir <- file.path(analysis_dir, "data", "ref_files")                         # Define directory containing reference annotation files
+data_dir <- file.path(analysis_dir, "data_CN_only/preprocessing/FHS")           # Define directory for processed Framingham data
+
+source(file.path(code_dir, "run_parallel.R"), local = TRUE)                     # Source parallel processing helper functions
+source(file.path(code_dir, "detectionp_functions.R"), local = TRUE)             # Source detection p-value helper functions
+```
+
+## Read Data
+
+```{r load_data}
+dnam_data <- readRDS(file.path(data_dir, "DNAm_data.RDS"))                      # Load previously QC-filtered DNAm SummarizedExperiment
+```
+
+# detectionP
+
+## Get detectionP scores
+
+```{r detection_p}
+assay_data <- SummarizedExperiment::assays(dnam_data)$dnam                      # Extract raw methylation assay from SummarizedExperiment
+detp_df <- data.frame(                                                          # Initialize empty data frame for detection p failures
+  sample = character(),                                                         # Column for sample identifiers
+  cpg = character()                                                             # Column for CpG probe identifiers
+)                                                                               # End detection p-value data frame initialization
+
+for (plate in unique(dnam_data$Batch)) {                                        # Iterate over each unique processing batch
+  print(paste0("detectionP on : ", plate))                                      # Print batch currently being processed
+  detp_df <- rbind(                                                             # Append detection p failures for this batch
+    detp_df,                                                                    # Existing detection p failure records
+    detectionp_plate(                                                           # Run detection p-value filtering per plate
+      dnam_data,                                                                # Full DNAm SummarizedExperiment
+      plate,                                                                    # Current batch identifier
+      threshold = 0.01,                                                         # Detection p-value threshold
+      plate_col = "Batch"                                                       # Column name indicating batch membership
+    )                                                                           # End detection p-value computation
+  )                                                                             # End row binding
+}                                                                               # End batch loop
+```
+
+## Get Probe Annotation
+
+```{r get_annot}
+anno_df <- read.csv(                                                            # Read EPIC manifest annotation file
+  file.path(ref_dir, "infinium-methylationepic-v-1-0-b5-manifest-file.csv"),    # Manifest file path
+  skip = 7                                                                      # Skip non-data header rows
+) %>%                                                                           # Begin annotation processing pipeline
+  dplyr::select(                                                                # Select relevant annotation fields
+    "Name",                                                                     # CpG probe ID
+    seqnames = "CHR_hg38",                                                      # Chromosome (hg38)
+    pos = "Start_hg38",                                                         # Genomic position (hg38)
+    Relation_to_Island = "Relation_to_UCSC_CpG_Island",                         # CpG island context
+    "UCSC_RefGene_Name",                                                        # Associated gene names
+    "UCSC_RefGene_Group",                                                       # Gene region context
+    type12 = "Infinium_Design_Type"                                             # Infinium probe type
+  ) %>%                                                                         # Continue annotation filtering
+  dplyr::filter(                                                                # Remove probes with missing or invalid coordinates
+    (!is.na(.data$pos)) & (nchar(.data$type12) > 0)                             # Require position and design type
+  ) %>%                                                                         # Continue filtering
+  dplyr::filter(.data$seqnames != "chrM")                                       # Exclude mitochondrial probes
+
+row.names(anno_df) <- anno_df$Name                                              # Set probe IDs as row names for annotation table
+```
+
+## Convert to beta values
+
+```{r convert_beta}
+assay_data <- minfi::getBeta(assay_data)                                        # Convert raw intensities to beta values
+assay_data <- assay_data[row.names(assay_data) %in% row.names(anno_df), ]       # Retain probes present in annotation
+anno_df <- anno_df[row.names(assay_data), ]                                     # Subset annotation to retained probes
+
+pheno_df <- dnam_data %>%                                                       # Extract phenotype metadata
+  SummarizedExperiment::colData() %>%                                           # Access column metadata
+  as.data.frame()                                                               # Convert to data frame
+
+dnam_data <- SummarizedExperiment::SummarizedExperiment(                        # Rebuild SummarizedExperiment with beta values
+  assays = list(dnam = assay_data),                                             # Store beta matrix as assay
+  rowData = anno_df,                                                            # Attach probe annotation as row data
+  colData = pheno_df                                                            # Attach phenotype metadata
+)                                                                               # End SummarizedExperiment reconstruction
+```
+
+# Probe Filtering
+
+## Filter to Probes Starting with 'cg'
+
+```{r filter_cg}
+dnam_data <- dnam_data[grep("cg", row.names(assay_data)), ]                     # Retain only CpG probes (exclude control probes)
+```
+
+## Filter Probes by SNP distance, cross hybridization
+
+```{r filter_snp}
+
+assay_data <- SummarizedExperiment::assays(dnam_data)$dnam                      # Extract beta-value assay for SNP filtering
+
+assay_data <- DMRcate::rmSNPandCH(                                              # Remove SNP-affected and cross-hybridizing probes
+  assay_data,                                                                   # Beta-value matrix
+  dist = 5,                                                                     # SNP distance threshold in base pairs
+  mafcut = 0.01,                                                                # Minor allele frequency cutoff
+  and = TRUE,                                                                   # Require all filtering criteria
+  rmcrosshyb = TRUE,                                                            # Remove cross-hybridizing probes
+  rmXY = FALSE                                                                  # Retain sex chromosome probes
+)                                                                               # End SNP and cross-hybridization filtering
+
+row_df <- dnam_data %>%                                                         # Begin probe-level metadata construction
+  SummarizedExperiment::rowData() %>%                                           # Extract existing row annotation
+  as.data.frame() %>%                                                           # Convert to data frame
+  dplyr::mutate(filter_snp = !(.data$Name %in% row.names(assay_data))) %>%      # Flag probes removed by SNP filtering
+  dplyr::mutate(filter_xy = .data$seqnames %in% c("chrX", "chrY"))              # Flag probes on sex chromosomes
+```
+
+## Relabel Rows
+
+```{r se_final}
+assay_data <- SummarizedExperiment::assays(dnam_data)$dnam                      # Re-extract beta assay (unchanged matrix)
+pheno_df <- dnam_data %>%                                                       # Extract phenotype metadata
+  SummarizedExperiment::colData() %>%                                           # Access column metadata
+  as.data.frame()                                                               # Convert to data frame
+
+dnam_data <- SummarizedExperiment::SummarizedExperiment(                        # Rebuild SummarizedExperiment with updated row metadata
+  assays = list(dnam = assay_data),                                             # Beta-value assay
+  rowData = row_df,                                                             # Updated probe-level metadata
+  colData = pheno_df                                                            # Phenotype metadata
+)                                                                               # End SummarizedExperiment reconstruction
+```
+
+## Filter detection P probes
+
+Some of the probes are missing from the probe annotation file. We filter those out, so they also need to be filtered out from the detectionP results
+
+```{r filter_detp}
+detp_df <- detp_df %>%                                                          # Filter detection p-value failures
+  dplyr::filter(.data$cpg %in% row.names(dnam_data))                            # Retain only probes still present
+```
+
+# Get NA Probes
+
+## Filter to Probes and Samples with NAs
+
+```{r adjust_na}
+na_data <- is.na(assay_data)                                                    # Identify missing beta values
+row_counts <- rowSums(na_data)                                                  # Count missing values per probe
+na_data <- na_data[row_counts > 0, ]                                            # Retain probes with any missing values
+col_counts <- colSums(na_data)                                                  # Count missing values per sample
+na_data <- na_data[, col_counts > 0]                                            # Retain samples with any missing values
+```
+
+## Get NA dataframe
+
+```{r data_na}
+na_df <- which(na_data, arr.ind = TRUE) %>%                                     # Convert NA positions to index pairs
+  as.data.frame()                                                               # Convert index matrix to data frame
+
+inds <- cbind(na_df$row, na_df$col)                                             # Store row/column indices for missing values
+
+cpg_df <- data.frame(                                                           # Create CpG index lookup table
+  row = 1:nrow(na_data),                                                        # Row indices
+  cpg = row.names(na_data)                                                      # CpG probe IDs
+)                                                                               # End CpG lookup table
+
+sample_df <- data.frame(                                                        # Create sample index lookup table
+  col = 1:ncol(na_data),                                                        # Column indices
+  sample = colnames(na_data)                                                    # Sample IDs
+)                                                                               # End sample lookup table
+
+na_df <- na_df %>%                                                              # Annotate missing values with IDs
+  dplyr::left_join(cpg_df, by = "row") %>%                                      # Add CpG probe identifiers
+  dplyr::left_join(sample_df, by = "col") %>%                                   # Add sample identifiers
+  dplyr::select("sample", "cpg")                                                # Retain relevant columns only
+```
+
+# Filter High Missing Samples
+
+We filter out any samples that have at least 5% of their non-XY probes with high detection P values
+
+## Get Counts
+
+```{r sample_filter_detp}
+base_probes <- row_df %>%                                                       # Identify baseline probes for sample filtering
+  dplyr::filter(!.data$filter_xy) %>%                                           # Exclude sex chromosome probes
+  dplyr::pull("Name")                                                           # Extract probe IDs
+
+base_df <- detp_df %>%                                                          # Summarize detection failures per sample
+  dplyr::filter(.data$cpg %in% base_probes) %>%                                 # Restrict to baseline probes
+  dplyr::group_by(.data$sample) %>%                                             # Group by sample
+  dplyr::summarise(missing_count = n()) %>%                                     # Count failed probes per sample
+  dplyr::ungroup() %>%                                                          # Remove grouping
+  dplyr::mutate(                                                                # Flag samples exceeding missingness threshold
+    to_filter = .data$missing_count >= 0.05 * length(base_probes)               # ≥5% failed probes
+  )                                                                             # End sample QC flag
+
+to_drop <- base_df %>%                                                          # Identify samples to remove
+  dplyr::filter(.data$to_filter) %>%                                            # Retain failing samples
+  dplyr::pull("sample")                                                         # Extract sample IDs
+
+dnam_data <- dnam_data[, !(dnam_data$sample %in% to_drop)]                      # Remove failing samples from DNAm data
+na_df <- na_df %>%                                                              # Remove dropped samples from NA table
+  dplyr::filter(!(.data$sample %in% to_drop))                                   # Retain passing samples only
+detp_df <- detp_df %>%                                                          # Remove dropped samples from detection p table
+  dplyr::filter(!(.data$sample %in% to_drop))                                   # Retain passing samples only
+```
+
+# Save Results
+
+```{r save}
+saveRDS(dnam_data, file = file.path(data_dir, "DNAm_beta.RDS"))                 # Save final beta-value DNAm object
+
+write.csv(                                                                      # Write detection p-value failure table
+  detp_df,                                                                      # Detection p-value failures
+  file = file.path(data_dir, "detectionP_Failures.csv"),                        # Output file path
+  row.names = FALSE                                                             # Do not write row names
+)                                                                               # End CSV export
+
+write.csv(                                                                      # Write missing-probe table
+  na_df,                                                                        # Missing probe/sample combinations
+  file = file.path(data_dir, "probes_missing.csv"),                             # Output file path
+  row.names = FALSE                                                             # Do not write row names
+)                                                                               # End CSV export
+
+row_df <- dnam_data %>%                                                         # Extract final probe metadata
+  SummarizedExperiment::rowData() %>%                                           # Access row data
+  as.data.frame()                                                               # Convert to data frame
+
+pheno_df <- dnam_data %>%                                                       # Extract final phenotype metadata
+  SummarizedExperiment::colData() %>%                                           # Access column data
+  as.data.frame()                                                               # Convert to data frame
+
+write.csv(                                                                      # Write filtered probe annotation table
+  row_df,                                                                       # Probe-level metadata
+  file = file.path(data_dir, "probes_filtered.csv"),                            # Output file path
+  row.names = TRUE                                                              # Preserve probe IDs
+)                                                                               # End CSV export
+
+write.csv(                                                                      # Write filtered phenotype table
+  pheno_df,                                                                     # Sample-level metadata
+  file = file.path(data_dir, "phenotype_filtered.csv"),                         # Output file path
+  row.names = TRUE                                                              # Preserve sample IDs
+)                                                                               # End CSV export
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()                                                                   # Print session/package versions for reproducibility
+```
+</details>

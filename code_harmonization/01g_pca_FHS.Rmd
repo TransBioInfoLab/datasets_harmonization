@@ -1,0 +1,127 @@
+---
+title: "Use PCAs to filter out outliers"
+author: 
+  - David lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: yeti
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({                                                              # Suppress startup messages for cleaner logs
+  library(dplyr)                                                                # For data manipulation
+  library(irlba)                                                                # For efficient truncated SVD/PCA
+  library(SummarizedExperiment)                                                 # For handling SummarizedExperiment objects
+  library(parallel)                                                             # For parallel processing backend
+  library(doParallel)                                                           # For parallel processing with foreach
+})                                                                              # End suppressMessages
+
+base_dir <- "../../.."                                                          # Define project base directory relative to script location
+analysis_dir <- file.path(base_dir, "DATASET", "_HARMONIZATION")                # Define harmonization analysis directory
+code_dir <- file.path(analysis_dir, "R")                                        # Define directory containing helper R scripts
+data_dir <- file.path(analysis_dir, "data_CN_only/preprocessing/FHS")           # Define directory for processed Framingham data
+submit_dir <- file.path(analysis_dir, "data_CN_only/submission/FHS")            # Define directory for final Framingham data
+
+source(file.path(code_dir, "run_pca.R"), local = TRUE)                          # source PCA functions
+```
+
+# Load Data
+
+```{r load}
+dnam_data <- readRDS(file.path(data_dir, "DNAm_batched.RDS"))                   # Read batch-corrected DNA methylation data
+```
+
+# Run PCA
+
+```{r pca}
+pca_res <- process_dataset(                                                     # Run PCA workflow with outlier detection
+  dnam_data,                                                                    # Input SummarizedExperiment object
+  outlier_cutoff = 3,                                                           # Z-score threshold (3 SD from mean)
+  pc_count = 5,                                                                 # Calculate 5 principal components
+  pc_label = "PC_",                                                             # Prefix for PC column names
+  outlier_label = "is_outlier",                                                 # Column name for outlier flag
+  filter_outlier = FALSE                                                        # Keep all samples (don't remove outliers)
+)                                                                               # Returns list with PCA results
+dnam_data <- pca_res$dnam_data                                                  # Extract updated SummarizedExperiment
+pca_df <- pca_res$pca_df                                                        # Extract data frame with PC scores
+percentVar <- pca_res$percentVar                                                # Extract variance explained by each PC
+pca_params <- pca_res$pca_params                                                # Extract PC summary statistics
+```
+
+# Plot
+
+```{r plot}
+message(                                                                        # Print outlier summary message
+  "In ",                                                                        # Dataset identifier prefix
+  "FHS",                                                                        # Dataset name
+  " there are a total of ",                                                     # Message text
+  sum(pca_df$is_outlier),                                                       # Count outlier samples
+  " outliers out of ",                                                          # Message text
+  nrow(pca_df),                                                                 # Total number of samples
+  " samples"                                                                    # Message suffix
+)                                                                               # End message
+
+for (plot_var in plot_vars) {                                                   # Loop through plotting variables
+  pca_df[,plot_var] <- as.character(pca_df[,plot_var])                          # Convert plot variable to character
+  p <- plot_pca(                                                                # Create PCA scatter plot
+    pca_df,                                                                     # Data frame with PC scores and metadata
+    dataset = "FHS",                                                            # Dataset name for plot title
+    plot_var = c("age_split_by_tertiles", "Sex"),                               # Variables for coloring points
+    percentVar = percentVar,                                                    # Variance explained (for axis labels)
+    pca_params = pca_params,                                                    # PC statistics (for outlier boundaries)
+    outlier_cutoff = 3,                                                         # Z-score threshold for boundaries
+    pc_label = "PC_",                                                           # Prefix for PC column names
+    outlier_label = "is_outlier"                                                # Column name for outlier flag
+  )                                                                             # Returns ggplot2 object
+  
+  print(p)                                                                      # Display plot
+}                                                                               # End for loop
+```
+
+# Save
+
+```{r save}
+saveRDS(dnam_data, file = file.path(data_dir, "DNAm_pca.RDS"))                  # Save final beta-value DNAm object
+
+exp_data <- SummarizedExperiment::assays(dnam_data)$dnam %>%                    # Extract beta value matrix
+  as.data.frame() %>%                                                           # Convert to data frame
+  tibble::rownames_to_column(var = "CpG")                                       # Add CpG IDs as first column
+
+write.table(                                                                    # Write harmonized data to file
+  x = exp_data,                                                                 # Data frame to write
+  file = file.path(submit_dir, paste0(dataset, "_harmonized.tsv")),             # Output file path
+  quote = FALSE,                                                                # Don't quote strings
+  sep = "\t",                                                                   # Tab-separated format
+  row.names = FALSE,                                                            # Don't write row names
+  col.names = TRUE                                                              # Write column names
+)                                                                               # End write.table
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()                                                                   # Print session/package versions for reproducibility
+```
+</details>

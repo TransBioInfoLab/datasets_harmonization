@@ -1,0 +1,83 @@
+---
+title: "Batch correct data using Harman"
+author: 
+  - David lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: yeti
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({                                                              # Suppress startup messages for cleaner logs
+  library(dplyr)                                                                # For data manipulation
+  library(Harman)                                                               # For batch correction
+  library(SummarizedExperiment)                                                 # For handling SummarizedExperiment objects
+  library(parallel)                                                             # For parallel processing backend
+  library(doParallel)                                                           # For parallel processing with foreach
+})                                                                              # End suppressMessages
+
+base_dir <- "../../.."                                                          # Define project base directory relative to script location
+analysis_dir <- file.path(base_dir, "DATASET", "_HARMONIZATION")                # Define harmonization analysis directory
+code_dir <- file.path(analysis_dir, "R")                                        # Define directory containing helper R scripts
+data_dir <- file.path(analysis_dir, "data_CN_only/preprocessing/FHS")           # Define directory for processed Framingham data
+
+source(file.path(code_dir, "harman_functions.R"), local = TRUE)                 # source modifications to Harman functions
+source(file.path(code_dir, "batch_functions.R"), local = TRUE)                  # source batch correction functions
+```
+
+# Load Data
+
+```{r load}
+dnam_data <- readRDS(file.path(data_dir, "DNAm_imputed.RDS"))                   # Read normalized DNA methylation data
+```
+
+# Run Batch Correction
+
+```{r batch}
+batch_res <- batch_data(                                                        # Run batch correction
+  dnam_data,                                                                    # Input SummarizedExperiment object
+  batch_var = "Batch",                                                          # Column name for batch IDs
+  expt_vars = "age_split_by_tertiles",                                          # Biological covariate to preserve
+  max_pc = 750                                                                  # Max PCs for dimensionality reduction
+)                                                                               # Returns list with Harman results
+
+harman_data <- batch_res$harman_data                                            # Extract Harman object from results
+use_full <- batch_res$use_full                                                  # Extract method flag (full vs adjusted)
+
+correct_data <- reconstruct_data(dnam_data, harman_data, use_full = use_full)   # Reconstruct corrected beta values
+```
+
+# Save
+
+```{r save}
+saveRDS(dnam_data, file.path(data_dir, "DNAm_batched.RDS"))                     # Save final beta-value DNAm object
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()                                                                   # Print session/package versions for reproducibility
+```
+</details>

@@ -1,0 +1,132 @@
+---
+title: "Impute probes with detectionP > 0.01"
+subtitle: "Look at autosomal probes"
+author: 
+  - David lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: yeti
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({                                                              # Suppress startup messages for cleaner logs
+  library(dplyr)                                                                # Load dplyr for data manipulation
+  library(methyLImp2)                                                           # Load methyLImp2 for DNA methylation imputation functions
+})                                                                              # End suppressed library loading block
+
+
+base_dir <- "../../.."                                                          # Define project base directory relative to script location
+analysis_dir <- file.path(base_dir, "DATASET", "_HARMONIZATION")                # Define harmonization analysis directory
+code_dir <- file.path(analysis_dir, "R")                                        # Define directory containing helper R scripts
+data_dir <- file.path(analysis_dir, "data_CN_only/preprocessing/FHS")           # Define directory for processed Framingham data
+
+source(file.path(code_dir, "dnam_impute_functions.R"), local = TRUE)            # Source imputation helper functions
+```
+
+# Load Data
+
+## Load Data
+
+```{r load_probes}
+dnam_data <- readRDS(file.path(data_dir, "DNAm_beta.RDS"))                      # Load previously QC-filtered DNAm SummarizedExperiment
+
+pheno_df <- dnam_data %>%                                                       # Extract phenotype metadata
+  SummarizedExperiment::colData() %>%                                           # Access column metadata
+  as.data.frame()                                                               # Convert to data frame
+
+probe_df <- dnam_data %>%                                                       # Extract probe metadata
+  SummarizedExperiment::rowData() %>%                                           # Access row metadata
+  as.data.frame() %>%                                                           # Convert to data frame
+  dplyr::rename(cpg = "Name") %>%                                               # Rename 'Name' column to 'cpg' for consistency with downstream code
+  dplyr::filter(!(.data$seqnames %in% c("chrM", "chrX", "chrY")))               # Remove mitochondrial, X chromosome, and Y chromosome probes (retain only autosomal chromosomes 1-22)
+dnam_data <- dnam_data[probe_df$cpg, ]                                          # Subset methylation data to retain only autosomal probes identified above
+```
+
+## Load Target Probes
+
+```{r load_detp}
+detp_df <- read.csv(file.path(data_dir, "detectionP_Failures.csv")) %>%         # Read CSV file containing detection p-value failure information
+  dplyr::filter(.data$cpg %in% probe_df$cpg) %>%                                # Keep only detection failures for autosomal probes retained in previous step
+  dplyr::filter(.data$sample %in% pheno_df$sample) %>%                          # Keep only detection failures for samples present in the methylation dataset
+  dplyr::filter(.data$detp >= 0.01)                                             # Retain only failed measurements where detection p-value is >= 0.01 (indicating poor quality signal)
+```
+
+# Run Impute
+
+## Impute Probes in Batches
+
+```{r impute_run}
+batches <- dnam_data %>%                                                        # Begin pipeline to identify unique batch identifiers
+  SummarizedExperiment::colData() %>%                                           # Extract column metadata from SummarizedExperiment object
+  as.data.frame() %>%                                                           # Convert to data frame for manipulation
+  dplyr::pull("Batch") %>%                                                      # Extract the 'Batch' column as a vector
+  unique()                                                                      # Get unique batch identifiers to process separately
+  
+dnam_data <- impute_batches(dnam_data, detp_df, batches)                        # Impute missing values within each batch separately using custom function (accounts for batch-specific patterns)
+
+```
+
+## Filter Detection P
+
+```{r filter_detp}
+pheno_df <- dnam_data %>%                                                       # Extract phenotype metadata
+  SummarizedExperiment::colData() %>%                                           # Access column metadata
+  as.data.frame()                                                               # Convert to data frame
+
+detp_df <- get_na_targets(pheno_df, detp_df)                                    # Update detection failure dataframe to identify remaining missing values that require imputation
+
+```
+
+## Impute Together
+
+```{r impute_run_full}
+beta_data <- get_beta_data(dnam_data, detp_df)                                  # Extract beta value matrix and prepare for imputation (marks remaining failures as NA)
+probe_df <- get_probe_df(dnam_data)                                             # Extract updated probe annotation dataframe with chromosome information
+
+beta_data <- impute_beta_nobatch(beta_data, probe_df)                           # Impute remaining missing values across entire dataset without batch separation (for values not imputed in batch-specific step)
+dnam_data <- SummarizedExperiment::SummarizedExperiment(                        # Reconstruct SummarizedExperiment object with imputed data
+  assays = list(dnam = t(beta_data)),                                           # Create assay list with transposed beta matrix (transpose to restore original dimensions: probes × samples)
+  rowData = dnam_data %>%                                                       # Preserve original row metadata (probe annotations)
+    SummarizedExperiment::rowData() %>%                                         # Extract row metadata from original object
+    as.data.frame(),                                                            # Convert to data frame
+  colData = dnam_data %>%                                                       # Preserve original column metadata (sample phenotypes)
+    SummarizedExperiment::colData() %>%                                         # Extract column metadata from original object
+    as.data.frame()                                                             # Convert to data frame
+)                                                                               # End of SummarizedExperiment reconstruction
+
+```
+
+# Save
+
+```{r save}
+saveRDS(dnam_data, file.path(data_dir, "DNAm_imputed.RDS"))                     # Save final beta-value DNAm object
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()                                                                   # Print session/package versions for reproducibility
+```
+</details>

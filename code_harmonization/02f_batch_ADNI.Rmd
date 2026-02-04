@@ -1,0 +1,204 @@
+---
+title: "Batch correct data using Harman"
+author: 
+  - David lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: yeti
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+  library(Harman)
+  library(SummarizedExperiment)
+  library(parallel)
+  library(doParallel)
+})
+
+base_dir <- "../../.."
+analysis_dir <- file.path(base_dir, "DATASET", "_HARMONIZATION")
+code_dir <- file.path(analysis_dir, "R")
+data_dir <- file.path(analysis_dir, "data_CN_only/preprocessing/ADNI")
+
+source(file.path(code_dir, "harman_functions.R"), local = TRUE)
+```
+
+# Define Functions
+
+## Load Data
+
+```{r func_load}
+prepare_dnam_metadata <- function(dnam_data, dataset) {
+  dnam_data$age_split_by_tertiles <- ntile(dnam_data$Age, 3)
+  if (dataset == "FHS") {
+    batches <- dnam_data$Batch
+    batches <- ifelse(batches == "B0019", "B0018", batches)
+    dnam_data$Batch <- batches
+  }
+  
+  dnam_data
+}
+
+load_data <- function(dataset) {
+  dnam_data <- readRDS(file.path(data_dir, "DNAm_normalized.RDS"))
+  
+  dnam_data <- prepare_dnam_metadata(dnam_data, dataset)
+  
+  dnam_data
+}
+```
+
+## Batch Correct
+
+```{r func_batch}
+get_batch_params <- function(
+    dnam_data, batch_var = "Batch", expt_vars = c("sex", "DX")
+) {
+  pheno_df <- dnam_data %>%
+    SummarizedExperiment::colData() %>%
+    as.data.frame()
+  
+  batches <- pheno_df %>%
+    dplyr::pull(as.name(batch_var)) %>%
+    as.character()
+  
+  expt <- pheno_df %>%
+    dplyr::pull(as.name(expt_vars[[1]])) %>%
+    as.character()
+  
+  if (length(expt_vars) > 1) {
+    for (expt_var in expt_vars[2:length(expt_vars)]) {
+      expt_add <- pheno_df %>%
+        dplyr::pull(as.name(expt_var)) %>%
+        as.character()
+      expt <- paste0(expt, "_", expt_add)
+    }
+  }
+  
+  expt <- as.factor(expt)
+  batches <- as.factor(batches)
+  
+  list(batch = batches, expt = expt)
+}
+
+batch_data <- function(
+    dnam_data,
+    batch_var = "Batch",
+    expt_vars = c("sex", "DX"),
+    randseed = 42,
+    max_pc = 1000
+) {
+  batch_params <- get_batch_params(
+    dnam_data,
+    batch_var = batch_var,
+    expt_vars = expt_vars
+  )
+  batch <- batch_params$batch
+  expt <- batch_params$expt
+  
+  m_data <- SummarizedExperiment::assays(dnam_data)$dnam %>%
+    Harman::shiftBetas(shiftBy = 1e-4) %>%
+    lumi::beta2m()
+  
+  if (max_pc >= ncol(dnam_data)) {
+    use_full <- TRUE
+    harman_data <- Harman::harman(
+      m_data,
+      expt = expt,
+      batch = batch,
+      limit = 0.95,
+      randseed = randseed
+    )    
+  } else {
+    use_full <- FALSE
+    harman_data <- harman_adjusted(
+      m_data,
+      expt = expt,
+      batch = batch,
+      limit = 0.95,
+      randseed = randseed,
+      max_pc = max_pc
+    )
+  }
+  
+  list(harman_data = harman_data, use_full = use_full)
+}
+
+reconstruct_data <- function(dnam_data, harman_data, use_full = TRUE) {
+  if (use_full) {
+    correct_data <- Harman::reconstructData(harman_data)
+  } else {
+    correct_data <- reconstructData_adjusted(harman_data)
+  }
+  
+  correct_data <- lumi::m2beta(correct_data)
+  correct_data <- SummarizedExperiment::SummarizedExperiment(
+    assays = list(dnam = correct_data),
+    rowData = dnam_data %>%
+      SummarizedExperiment::rowData(),
+    colData = dnam_data %>%
+      SummarizedExperiment::colData()
+  )
+  
+  correct_data
+}
+```
+
+## Wrapper Function
+
+```{r func_wrapper}
+process_dataset <- function(dataset, expt_vars, max_pc = 1000) {
+  message("Start ", dataset)
+  dnam_data <- load_data(dataset)
+  batch_res <- batch_data(
+    dnam_data, batch_var = "Batch", expt_vars = expt_vars, max_pc = max_pc
+  )
+  harman_data <- batch_res$harman_data
+  use_full <- batch_res$use_full
+  
+  message("Batched ", dataset)
+  
+  correct_data <- reconstruct_data(dnam_data, harman_data, use_full = use_full)
+  
+  saveRDS(
+    correct_data,
+    file.path(data_dir, "DNAm_batched.RDS")
+  )
+}
+```
+
+# Run
+
+```{r run}
+process_dataset(dataset = "ADNI", expt_vars = "age_split_by_tertiles", max_pc = 750)
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

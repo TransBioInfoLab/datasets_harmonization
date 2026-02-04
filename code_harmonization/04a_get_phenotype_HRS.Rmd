@@ -1,0 +1,148 @@
+---
+title: "Read in HRS NIAGADS DNA methylation data"
+author: 
+  - David lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: yeti
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline    
+---
+
+# Set Up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+  library(tidyr)
+  library(haven)
+})
+
+base_dir <- "../../.."
+analysis_dir <- file.path(base_dir, "DATASET", "HRS")
+pheno_dir <- file.path(analysis_dir, "Phenotype")
+hcap_dir <- file.path(analysis_dir, "Phenotype", "HCAP")
+harmony_dir <- file.path(base_dir, "DATASET/_HARMONIZATION/data_CN_only")
+save_dir <- file.path(harmony_dir, "preprocessing/HRS")
+```
+
+# Get Sample Data
+
+## Read Sample Attributes
+
+```{r read_pheno}
+pheno_df <- read.table(
+  file.path(pheno_dir, "NIAGADS", "phenotype.tsv"), 
+  sep = "\t", 
+  header = TRUE
+) %>%
+  dplyr::rename(Age = "Age.at.Data.Collection", Sex = "Gender") %>%
+  dplyr::mutate(
+     Sex = ifelse(.data$Sex %in% c("M", "Male", "MALE"), "MALE", "FEMALE")
+  )
+```
+
+## Read Methylation Plate Information
+
+```{r read_plate}
+plate_df <- read.csv(
+  file.path(pheno_dir, "NIAGADS", "sample_parameters.csv")
+) %>%
+  dplyr::select(
+    "SubjectID_Submitter", 
+    "Sample_Plate", 
+    "Array",
+    "Slide")
+```
+
+## Get Dementia Status
+
+```{r read_dementia}
+dem_df <- haven::read_dta(
+  file.path(pheno_dir, "HCAP", "LangaWeir2020v2", "cogfinalimp_9520wide.dta")
+) %>%
+  dplyr::select(HHID = "hhid", PN = "pn", Dementia = "cogfunction2016")
+linkage_df <- haven::read_sas(
+  file.path(pheno_dir, "Linkage-file", "niagads_id_crosswalk.sas7bdat")
+)
+```
+
+## Merge Dataframes
+
+```{r merge}
+match_df <- read.csv(file.path(pheno_dir, "NIAGADS","idat_crosswalk.csv")) %>%
+  dplyr::select(-"X")
+
+pheno_df <- pheno_df %>%
+  dplyr::left_join(match_df, by = c("SubjectID_Submitter" = "SubjectID")) %>%
+  dplyr::left_join(plate_df, by = "SubjectID_Submitter") %>%
+  dplyr::left_join(linkage_df, by = "SubjectID_Submitter") %>%
+  dplyr::left_join(dem_df, by = c("HHID", "PN")) %>%
+  dplyr::mutate(sample = .data$SubjectID_Submitter)
+```
+
+# Adjust Dataframe
+
+## Adjust Plate and Batch Labels
+
+```{r adjust_batch}
+pheno_df <- pheno_df %>%
+  dplyr::arrange(.data$SubjectID_Submitter) %>%
+  tidyr::separate(
+    "Sample_Plate", 
+    c("Sample_Plate", NA),
+    sep = "/",
+    remove = TRUE
+  ) %>%
+  dplyr::mutate(
+    Batch = ifelse(
+      .data$Sample_Plate == "Thyagarajan_Sample_144",
+      "Thyagarajan_Sample_143",
+      .data$Sample_Plate
+    )
+  )
+```
+
+## Filter to Cognitive Normal
+
+```{r filter}
+pheno_df <- pheno_df %>%
+  dplyr::filter(.data$Dementia == 1)
+```
+
+# Save
+
+## Save Full
+
+```{r save}
+write.csv(
+  pheno_df,
+  file = file.path(save_dir, "phenotype_all.csv"),
+  row.names = FALSE
+)
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>

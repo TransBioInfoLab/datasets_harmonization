@@ -1,0 +1,293 @@
+---
+title: "Read in phenotype information for Framingham data"
+author: 
+  - David lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: yeti
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline    
+---
+
+# Set Up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)                                                                   # Data manipulation (filter, mutate, select, joins)
+  library(tidyr)                                                                   # Reshaping data (pivot_longer, replace_na)
+  library(purrr)                                                                   # Functional mapping over file lists (map)
+  library(data.table)                                                              # Fast I/O (fread) for large phenotype/sample files
+  library(stringr)                                                                 # String utilities (str_sub, str_remove)
+})
+
+base_dir    <- "../../.."                                                          # Project root (relative to script location)
+analysis_dir <- file.path(base_dir, "DATASET", "Framingham")                       # Root directory for Framingham dataset bundle
+raw_dir     <- file.path(analysis_dir, "DNAm/raw/EPIC")                            # Location of raw EPIC methylation assets
+pheno_dir   <- file.path(analysis_dir, "Phenotype/raw")                            # Location of raw phenotype releases
+data_dir    <- file.path(analysis_dir, "DNAm/processed/EPIC")                      # Location of processed DNAm outputs (not used here, kept for parity)
+harmony_dir <- file.path(base_dir, "DATASET/_HARMONIZATION/data_CN_only")          # Harmonization workspace (CN-only context)
+save_dir    <- file.path(harmony_dir, "preprocessing/FHS")                         # Destination folder for saved phenotype file
+```
+
+# Get Sample Data
+
+## Read Sample Attributes (from IDAT attribute files)    
+
+```{r read_sample}
+pheno_df <- list.files(                                                            # Start: enumerate all matching sample attribute files
+  path       = file.path(raw_dir, "sample_info"),                                  # Directory holding sample_info exports
+  pattern    = "idat.*.gz",                                                        # Pattern for IDAT attribute tables (gzipped)
+  full.names = TRUE                                                                # Return full file paths for fread
+) %>%                                                                              # Pipe file list into map/read/bind pipeline
+  purrr::map(., ~data.table::fread(., skip = 10)) %>%                              # Read each file, skipping dbGaP header lines
+  Reduce(rbind, .) %>%                                                             # Row-bind all tables into one data.frame
+  dplyr::mutate(                                                                   # Create derived identifiers
+    idat_label = stringr::str_sub(.data$Grn.idat, 1, 24)                           # Extract stable IDAT label from file name field
+  ) %>%                                                                            # Continue transformation pipeline
+  dplyr::select("dbGaP_Sample_ID", "SAMPLE_ID", "Batch", "idat_label") %>%         # Keep only fields needed downstream
+  dplyr::mutate(sample = .data$SAMPLE_ID)                                          # Create 'sample' alias (convenience/compatibility)
+
+```
+
+## Get Subject Information
+
+```{r read_subject}
+sample_df <- data.table::fread(                                                     # Read sample-to-subject mapping file(s)
+  list.files(                                                                       # Enumerate all Sample.MULTI files
+    path       = file.path(raw_dir, "sample_info"),                                 # Directory holding sample_info exports
+    pattern    = "Sample.MULTI.*.gz",                                               # Pattern for sample mapping tables
+    full.names = TRUE                                                               # Return full paths
+  ),                                                                                # End list.files for Sample.MULTI
+  skip = 10                                                                         # Skip dbGaP header lines
+) %>%                                                                               # Pipe into dplyr select
+  dplyr::select("dbGaP_Subject_ID", "SAMPLE_ID")                                    # Keep only subject and sample IDs
+
+share_df <- list.files(                                                             # Start: enumerate the Info tables with shareid/date fields
+  path       = file.path(pheno_dir, "Info/"),                                       # Phenotype Info folder
+  pattern    = "txt.gz",                                                            # Gzipped tab-delimited phenotype files
+  full.names = TRUE                                                                 # Return full paths
+) %>%                                                                               # Pipe file list into map/read/bind pipeline
+  purrr::map(., ~data.table::fread(., skip = 10)) %>%                               # Read each file, skipping dbGaP headers
+  Reduce(rbind, .) %>%                                                              # Row-bind into one table
+  dplyr::select("dbGaP_Subject_ID", "shareid", "idtype", "date2", "date9")          # Keep IDs and exam date anchors
+
+pheno_df <- pheno_df %>%                                                            # Start merging subject-level identifiers onto sample table
+  dplyr::left_join(sample_df, by = "SAMPLE_ID") %>%                                 # Add dbGaP_Subject_ID using SAMPLE_ID key
+  dplyr::left_join(share_df,  by = "dbGaP_Subject_ID")                              # Add shareid/idtype/date2/date9 using subject key
+```
+
+## Get Age and Collection Information
+
+```{r read_collection}
+age_df <- list.files(                                                               # Enumerate methylation sample attribute tables with age/visit
+  path       = file.path(raw_dir, "sample_info"),                                   # Directory holding sample_info exports
+  pattern    = "FHS_Methylation_Sample_Attributes.*txt.gz",                         # Pattern for collection-age attribute tables
+  full.names = TRUE                                                                 # Return full paths
+) %>%                                                                               # Pipe file list into map/read/bind pipeline
+  purrr::map(., ~data.table::fread(., skip = 10)) %>%                               # Read each file, skipping dbGaP headers
+  Reduce(rbind, .) %>%                                                              # Row-bind into one table
+  dplyr::select("SAMPLE_ID", Age = "Age_at_collection", "Collection_visit")         # Keep sample ID, age, and collection visit label
+
+pheno_df <- pheno_df %>%                                                            # Merge age/collection visit onto main phenotype table
+  dplyr::left_join(age_df, by = "SAMPLE_ID")                                        # Join by SAMPLE_ID so each sample has age/visit
+```
+
+## Calculate time since exam
+
+```{r read_exam_time}
+time_df <- pheno_df %>%                                                            # Start from main table containing Collection_visit and dates
+  dplyr::select("dbGaP_Sample_ID", "Collection_visit", "date2", "date9") %>%       # Keep only fields needed to compute time since exam
+  tidyr::pivot_longer(                                                             # Reshape wide date2/date9 into long format for matching
+    cols      = c("date2", "date9"),                                               # Date anchor columns to stack
+    names_to  = "date",                                                            # Name of the new column holding which date variable
+    values_to = "time_since_exam1"                                                 # Name of the new column holding the date value
+  ) %>%                                                                            # Continue transformation pipeline
+  dplyr::mutate(                                                                   # Harmonize visit label to match pivoted date variable names
+    Collection_visit = paste0("date", .data$Collection_visit)                      # Convert visit number (e.g., 2/9) into "date2"/"date9"
+  ) %>%                                                                            # Continue transformation pipeline
+  dplyr::filter(.data$Collection_visit == .data$date) %>%                          # Keep only the row matching the sample’s collection visit
+  dplyr::select("dbGaP_Sample_ID", "time_since_exam1")                             # Output only sample ID and its matched anchor date
+
+pheno_df <- pheno_df %>%                                                           # Merge computed anchor-date value back into main table
+  dplyr::left_join(time_df, by = "dbGaP_Sample_ID") %>%                            # Join by sample ID (dbGaP sample identifier)
+  tidyr::replace_na(list(time_since_exam1 = 0))                                    # If missing (no match), set to 0 as a conservative default
+
+```
+
+# Get Sample Attributes
+
+## Get Sex Information
+
+```{r get_sex}
+sex_df <- data.table::fread(                                                        # Read subject-level table containing SEX coding
+  list.files(                                                                       # Enumerate all Subject.MULTI files
+    path       = file.path(raw_dir, "sample_info"),                                 # Directory holding sample_info exports
+    pattern    = "Subject.MULTI.*.gz",                                              # Pattern for subject tables
+    full.names = TRUE                                                               # Return full paths
+  ),                                                                                # End list.files for Subject.MULTI
+  skip = 10                                                                         # Skip dbGaP header lines
+) %>%                                                                               # Pipe into mutate/select
+  dplyr::mutate(Sex = ifelse(.data$SEX == 1, "MALE", "FEMALE")) %>%                 # Recode SEX numeric to labeled Sex factor
+  dplyr::select("dbGaP_Subject_ID", "SUBJECT_ID", "Sex")                            # Keep IDs and recoded Sex
+
+pheno_df <- pheno_df %>%                                                            # Merge sex information onto sample-level table
+  dplyr::left_join(sex_df, by = "dbGaP_Subject_ID")                                 # Join via dbGaP_Subject_ID to attach Sex
+```
+
+## Get APOE Information
+
+```{r get_apoe}
+apoe_df <- list.files(                                                              # Enumerate APOE phenotype files
+  path       = file.path(pheno_dir, "APOE"),                                        # APOE folder within raw phenotype directory
+  pattern    = "csv.gz",                                                            # Gzipped CSV files
+  full.names = TRUE,                                                                # Return full paths
+  recursive  = TRUE                                                                 # Search subfolders if present
+) %>%                                                                               # Pipe file list into map/read/bind pipeline
+  purrr::map(., ~data.table::fread(.)) %>%                                          # Read each APOE table (no header skip assumed here)
+  Reduce(rbind, .) %>%                                                              # Row-bind into one APOE table
+  dplyr::mutate(                                                                    # Create APOE4 allele dosage using coding rules
+    APOE4 = ifelse(                                                                 # Start nested ifelse to translate APOE coding to allele count
+      APOE == 44,                                                                   # If genotype code indicates ε4/ε4
+      2,                                                                            # Then APOE4 dosage is 2
+      ifelse(APOE %in% c(24, 34), 1, 0)                                             # Else if ε2/ε4 or ε3/ε4 then 1; otherwise 0
+    )                                                                               # End nested ifelse
+  ) %>%                                                                             # Continue transformation pipeline
+  dplyr::select("shareid", "idtype", "APOE", "APOE4")                               # Keep identifiers and APOE/APOE4 variables
+
+pheno_df <- pheno_df %>%                                                            # Merge APOE fields onto main phenotype table
+  dplyr::left_join(apoe_df, by = c("shareid", "idtype"))                            # Join on shareid/idtype (phenotype-system identifiers)
+```
+
+## Get Smoking Status Information
+
+```{r get_smoking}
+smoking_df <- list.files(                                                           # Enumerate smoking phenotype files
+  path       = file.path(pheno_dir, "Smoking/"),                                    # Smoking folder
+  pattern    = "txt.gz",                                                            # Gzipped tab-delimited files
+  full.names = TRUE                                                                 # Return full paths
+) %>%                                                                               # Pipe into map/read/bind pipeline
+  purrr::map(., ~data.table::fread(., skip = 10)) %>%                               # Read each file, skipping dbGaP headers
+  Reduce(rbind, .) %>%                                                              # Row-bind into one smoking table
+  dplyr::rename(idtype = "IDTYPE") %>%                                              # Standardize IDTYPE column name to idtype for joins
+  tidyr::pivot_longer(                                                              # Convert STATUS1:STATUS9 columns into long format
+    cols      = STATUS1:STATUS9,                                                    # Smoking status fields across exam visits
+    names_to  = "Status",                                                           # Store original STATUS column name
+    values_to = "Smoking"                                                           # Store smoking value in a single column
+  ) %>%                                                                             # Continue transformation pipeline
+  dplyr::mutate(                                                                    # Parse visit number from STATUS column name
+    Collection_visit = as.integer(stringr::str_remove(.data$Status, "STATUS"))      # Convert "STATUS9" -> 9, etc.
+  ) %>%                                                                             # Continue transformation pipeline
+  dplyr::select(-"Status")                                                          # Drop temporary Status column
+
+pheno_df <- pheno_df %>%                                                            # Merge visit-matched smoking status onto main table
+  dplyr::left_join(                                                                 # Left join so samples remain even if smoking missing
+    smoking_df,                                                                     # Long-format smoking status table
+    by = c("dbGaP_Subject_ID", "shareid", "idtype", "Collection_visit")             # Join on subject IDs and collection visit
+  )                                                                                 # End left_join
+```
+
+## Get Education Status
+
+```{r get_education}
+edu_df <- list.files(                                                               # Enumerate education phenotype files
+  path       = file.path(pheno_dir, "Education/"),                                  # Education folder
+  pattern    = "txt.gz",                                                            # Gzipped tab-delimited files
+  full.names = TRUE                                                                 # Return full paths
+) %>%                                                                               # Pipe into map/read/bind pipeline
+  purrr::map(., ~data.table::fread(., skip = 10)) %>%                               # Read each file, skipping dbGaP headers
+  Reduce(rbind, .) %>%                                                              # Row-bind into one education table
+  dplyr::rename(Education_level = "education")                                      # Rename to explicit Education_level variable
+
+exam2_df <- list.files(                                                             # Enumerate Exam2 phenotype files (for education years)
+  path       = file.path(pheno_dir, "Exam2/"),                                      # Exam2 folder
+  pattern    = "txt.gz",                                                            # Gzipped tab-delimited files
+  full.names = TRUE                                                                 # Return full paths
+) %>%                                                                               # Pipe into map/read/bind pipeline
+  purrr::map(., ~data.table::fread(., skip = 10)) %>%                               # Read each file, skipping dbGaP headers
+  Reduce(rbind, .) %>%                                                              # Row-bind into one Exam2 table
+  dplyr::rename(Education_year = "B43") %>%                                         # Rename B43 to Education_year (years of education)
+  dplyr::select("dbGaP_Subject_ID", "shareid", "idtype", "Education_year")          # Keep only fields needed for merge
+
+pheno_df <- pheno_df %>%                                                            # Merge both education indicators onto main table
+  dplyr::left_join(edu_df,   by = c("dbGaP_Subject_ID", "shareid", "idtype")) %>%   # Attach Education_level by IDs
+  dplyr::left_join(exam2_df, by = c("dbGaP_Subject_ID", "shareid", "idtype"))       # Attach Education_year by IDs
+```
+
+## Get Dementia Status
+
+```{r get_dementia}
+dem_df <- list.files(                                                               # Enumerate dementia survival phenotype files
+  path       = file.path(pheno_dir, "Dementia/"),                                   # Dementia folder
+  pattern    = "demsurv.*txt.gz",                                                   # Pattern for dementia survival tables
+  full.names = TRUE                                                                 # Return full paths
+) %>%                                                                               # Pipe into map/read/bind pipeline
+  purrr::map(., ~data.table::fread(., skip = 10)) %>%                               # Read each file, skipping dbGaP headers
+  Reduce(rbind, .) %>%                                                              # Row-bind into one dementia survival table
+  dplyr::select(                                                                    # Keep only fields needed for merge
+    "dbGaP_Subject_ID",                                                             # Keep dbGaP_Subject_ID
+    "shareid",                                                                      # Keep shareid
+    "idtype",                                                                       # Keep idtype
+    "DEM_SURVDATE",                                                                 # Keep number of days of survival after Dementia
+    Dementia = "DEM_STATUS"                                                         # Keep dementia status
+  )                                                                                 # End select block
+
+pheno_df <- pheno_df %>%                                                            # Merge dementia fields and derive follow-up times
+  dplyr::left_join(dem_df, by = c("dbGaP_Subject_ID", "shareid", "idtype")) %>%     # Join dementia outcomes by phenotype-system IDs
+  dplyr::mutate(                                                                    # Compute follow-up relative to baseline exam anchor
+    dem_followup_time = .data$DEM_SURVDATE - .data$time_since_exam1,                # Time from baseline exam anchor to event/censoring date
+    dem_followup_year = round(.data$dem_followup_time / 365)                        # Approximate follow-up in years (rounded)
+  )                                                                                 # End mutate block
+```
+
+# Filter to Target Data
+
+## Filter to Offspring Cohort
+
+```{r filter_cohort}
+pheno_df <- pheno_df %>%                                                            # Start filtering pipeline
+  dplyr::filter(.data$idtype == 1)                                                  # Keep only offspring cohort records
+```
+
+## Filter by Dementia Status
+
+```{r filter_dementia}
+pheno_df <- pheno_df %>%
+pheno_df <- pheno_df %>%                                                            # Start filtering pipeline
+  dplyr::filter(.data$Dementia == 0) %>%                                            # Keep only dementia-negative at baseline
+  dplyr::filter(.data$dem_followup_time > 0)                                        # Keep only those with positive follow-up time
+```
+
+# Save
+
+```{r save}
+write.csv(                                                                         # Write final phenotype table to CSV
+  pheno_df,                                                                        # Data frame to export
+  file = file.path(save_dir, "phenotype_all.csv"),                                 # Output path (harmonization preprocessing folder)
+  row.names = FALSE                                                                # Do not write row names into CSV
+)               
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()                                                                   # Print session/package versions for reproducibility
+```
+</details>

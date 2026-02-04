@@ -1,0 +1,127 @@
+---
+title: "Normalize imputed values of autosomal probes"
+subtitle: "We only run BMIQ normalization, without prior quantile normalization"
+author: 
+  - David lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: yeti
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({                                                              # Suppress startup messages for cleaner logs
+  library(sm)                                                                   # For smoothed density plots
+  library(dplyr)                                                                # For data manipulation
+  library(wateRmelon)                                                           # For DNA methylation analysis functions
+  library(SummarizedExperiment)                                                 # For handling SummarizedExperiment objects
+  library(parallel)                                                             # For parallel processing backend
+  library(doParallel)                                                           # For parallel processing with foreach
+})                                                                              # End suppressMessages
+
+base_dir <- "../../.."                                                          # Define project base directory relative to script location
+analysis_dir <- file.path(base_dir, "DATASET", "_HARMONIZATION")                # Define harmonization analysis directory
+code_dir <- file.path(analysis_dir, "R")                                        # Define directory containing helper R scripts
+data_dir <- file.path(analysis_dir, "data_CN_only/preprocessing/FHS")           # Define directory for processed Framingham data
+
+source(file.path(code_dir, "bmiq_adjust.R"), local = TRUE)                      # source BMIQ adjustment function
+source(file.path(code_dir, "bmiq_repeat.R"), local = TRUE)                      # source multi-seed BMIQ wrapper
+source(file.path(code_dir, "run_parallel.R"), local = TRUE)                     # source parallel processing helpers 
+```
+
+## Load Data
+
+```{r load}
+dnam_data <- readRDS(file.path(data_dir, "DNAm_imputed.RDS"))                   # Read imputed DNA methylation data
+dnam_data$age_split_by_tertiles <- ntile(dnam_data$Age, 3)                      # Split age into three tertiles (1, 2, 3)
+batches <- dnam_data$Batch                                                      # Extract batch identifiers from metadata
+batches <- ifelse(batches == "B0019", "B0018", batches)                         # Merge batch B0019 into B0018 for consistency
+dnam_data$Batch <- batches                                                      # Update batch assignments in the object
+probe_df <- dnam_data %>%                                                       # Extract probe annotations
+  SummarizedExperiment::rowData() %>%                                           # Get row metadata (probe information)
+  as.data.frame()                                                               # Convert to data frame
+pheno_df <- dnam_data %>%                                                       # Extract sample phenotypes
+  SummarizedExperiment::colData() %>%                                           # Get column metadata (sample information)
+  as.data.frame()                                                               # Convert to data frame
+beta_data <- SummarizedExperiment::assays(dnam_data)$dnam                       # Extract beta value matrix from assays
+```
+
+# Run BMIQ Normalization
+
+## Plot Pre-Normalized Distribution
+
+```{r plot_raw}
+probe_type <- ifelse(probe_df$type12 == "I", 1, 2)                              # Convert probe type to numeric (1=Type I, 2=Type II)
+sm::sm.density.compare(                                                         # Create density comparison plot
+  beta_data[,1],                                                                # Use first sample for visualization
+  probe_type                                                                    # Group by probe type
+)                                                                               # Plot Type I vs Type II distributions (before)
+```
+
+## Run BMIQ
+
+```{r bmiq_run}
+beta_data <- multistep_bmiq(                                                    # Perform multi-seed BMIQ normalization
+  beta_data,                                                                    # Input beta value matrix
+  probe_df,                                                                     # Probe annotations with type information
+  seeds = c(1, 2, 4, 8, 16, 32, 64),                                            # Try these seeds sequentially for failed samples
+  cores = 16                                                                    # Use 16 CPU cores for parallel processing
+)                                                                               # Returns normalized beta values
+```
+
+## Plot Normalization Effect
+
+```{r plot_normed}
+probe_type <- ifelse(probe_df$type12 == "I", 1, 2)                              # Convert probe type to numeric again
+sm::sm.density.compare(                                                         # Create density comparison plot
+  beta_data[,1],                                                                # Use first sample for visualization
+  probe_type                                                                    # Group by probe type
+)                                                                               # Plot Type I vs Type II distributions (after)
+```
+
+## Create Summarized Experiment object
+
+```{r create_se}
+dnam_data <- SummarizedExperiment::SummarizedExperiment(                        # Create new SummarizedExperiment
+  assays = list(dnam = beta_data),                                              # Add normalized beta values as assay
+  rowData = probe_df,                                                           # Add probe annotations as row metadata
+  colData = pheno_df                                                            # Add sample phenotypes as column metadata
+)        
+```
+
+# Save
+
+## Save
+
+```{r save}
+saveRDS(dnam_data, file.path(data_dir, "DNAm_normalized.RDS"))                  # Save final beta-value DNAm object
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()                                                                   # Print session/package versions for reproducibility
+```
+</details>
+

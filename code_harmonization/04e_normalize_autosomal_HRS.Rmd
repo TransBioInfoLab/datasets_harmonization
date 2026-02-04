@@ -1,0 +1,124 @@
+---
+title: "Normalize imputed values of autosomal probes"
+subtitle: "We only run BMIQ normalization, without prior quantile normalization"
+author: 
+  - David lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: yeti
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(sm)
+  library(dplyr)
+  library(wateRmelon)
+  library(SummarizedExperiment)
+  library(parallel)
+  library(doParallel)
+})
+
+base_dir <- "../../.."
+analysis_dir <- file.path(base_dir, "DATASET", "_HARMONIZATION")
+code_dir <- file.path(analysis_dir, "R")
+data_dir <- file.path(analysis_dir, "data_CN_only/preprocessing/HRS")
+
+source(file.path(code_dir, "bmiq_adjust.R"), local = TRUE)
+source(file.path(code_dir, "bmiq_repeat.R"), local = TRUE)
+source(file.path(code_dir, "run_parallel.R"), local = TRUE)
+```
+
+## Load Data
+
+```{r load}
+dnam_data <- readRDS(file.path(data_dir, "DNAm_imputed.RDS"))
+dnam_data$age_split_by_tertiles <- ntile(dnam_data$Age, 3)
+probe_df <- dnam_data %>%
+  SummarizedExperiment::rowData() %>%
+  as.data.frame()
+pheno_df <- dnam_data %>%
+  SummarizedExperiment::colData() %>%
+  as.data.frame()
+beta_data <- SummarizedExperiment::assays(dnam_data)$dnam
+```
+
+# Run BMIQ Normalization
+
+## Plot Pre-Normalized Distribution
+
+```{r plot_raw}
+probe_type <- ifelse(probe_df$type12 == "I", 1, 2)
+sm::sm.density.compare(
+  beta_data[,1],
+  probe_type
+)
+```
+
+## Run BMIQ
+
+```{r bmiq_run}
+beta_data <- multistep_bmiq(
+  beta_data,
+  probe_df,
+  seeds = c(1, 2, 4, 8, 16, 32, 64),
+  cores = 16
+)
+```
+
+## Plot Normalization Effect
+
+```{r plot_normed}
+probe_type <- ifelse(probe_df$type12 == "I", 1, 2)
+sm::sm.density.compare(
+  beta_data[,1],
+  probe_type
+)
+```
+
+## Create Summarized Experiment object
+
+```{r create_se}
+dnam_data <- SummarizedExperiment::SummarizedExperiment(
+  assays = list(dnam = beta_data),
+  rowData = probe_df,
+  colData = pheno_df
+)
+```
+
+# Save
+
+## Save
+
+```{r save}
+saveRDS(dnam_data, file.path(data_dir, "DNAm_normalized.RDS"))
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>
+

@@ -1,0 +1,227 @@
+---
+title: "Impute education level, smoking status, and APOE for FHS"
+author: 
+  - David lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: yeti
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set Up
+
+## Load Libraries
+
+```{r library}
+suppressMessages({                                                              # Suppress startup messages for cleaner logs
+  library(dplyr)                                                                # For data manipulation
+  library(SummarizedExperiment)                                                 # For handling SummarizedExperiment objects
+  library(EpiSmokEr)                                                            # For smoking status prediction
+  library(mice)                                                                 # For multiple imputation
+  library(parallel)                                                             # For parallel processing backend
+  library(doParallel)                                                           # For parallel processing with foreach
+})                                                                              # End suppressMessages
+
+base_dir <- "../../.."                                                          # Define project base directory relative to script location
+analysis_dir <- file.path(base_dir, "DATASET", "_HARMONIZATION")                # Define harmonization analysis directory
+code_dir <- file.path(analysis_dir, "R")                                        # Define directory containing helper R scripts
+age_dir <- file.path(code_dir, "DNAm-based-age-predictor-master")               # Define directory containing age-prediction R scrips
+data_dir <- file.path(analysis_dir, "data_CN_only/preprocessing/FHS")           # Define directory for processed Framingham data
+submit_dir <- file.path(analysis_dir, "data_CN_only/submission/FHS")            # Define directory for final Framingham data
+ref_dir <- file.path(code_dir, "DNAm-based-age-predictor-master")
+
+source(file.path(code_dir, "run_parallel.R"), local = TRUE)                     # source parallel processing helpers 
+source(file.path(code_dir, "impute_functions.R"), local = TRUE)                 # source imputation functions
+source(file.path(age_dir, "pred_adjusted2.R"))                                  # source age prediciton functions
+```
+
+# Load Data
+
+```{r load}
+dnam_data <- readRDS(file.path(data_dir, "DNAm_pca.RDS"))                       # Read PCA-annotated DNA methylation data
+norm_data <- readRDS(file.path(data_dir, "DNAm_normalized.RDS"))                # Read normalized DNA methylation data
+
+beta <- SummarizedExperiment::assays(norm_data)$dnam                            # Extract beta value matrix
+pheno_df <- dnam_data %>%                                                       # Extract phenotype metadata
+  SummarizedExperiment::colData() %>%                                           # Get column metadata
+  as.data.frame()                                                               # Convert to data frame
+```
+
+# Predict Age
+
+```{r pred_age}
+age_df <- predict_age(beta, ref_dir)                                            # Predict epigenetic age using DNAm
+pheno_df$Age_pred <- age_df$ent_age                                             # Add predicted age to phenotype data
+```
+
+# Predict Smoking Status
+
+```{r pred_smoke}
+samplesheet = pheno_df %>%                                                      # Create samplesheet for EpiSmokEr
+  dplyr::select(sex = "Sex") %>%                                                # Select sex column
+  dplyr::mutate(sex = ifelse(.data$sex == "MALE", 1, 2))                        # Recode sex (1=male, 2=female)
+sst <- EpiSmokEr::epismoker(                                                    # Predict smoking status
+  dataset = beta,                                                               # DNA methylation values as input
+  samplesheet = samplesheet,                                                    # sample sheet of recoded sex
+  method = "SSt"                                                                # Use SSt method
+)                                                                               # End predict
+ssc <- EpiSmokEr::epismoker(                                                    # Predict smoking score
+  dataset = beta,                                                               # DNA methylation values as input
+  method = "SSc"                                                                # Use SSc method
+)                                                                               # End predict
+pheno_df$Smoking_pred <- sst$PredictedSmokingStatus                             # Add predicted smoking to phenotype
+pheno_df$Smoking_score <- ssc$smokingScore                                      # Add smoking score
+pheno_df <- pheno_df %>%                                                        # Impute missing smoking status
+  dplyr::mutate(                                                                # Convert predictions to numeric
+    Smoking_pred = ifelse(                                                      # Start conditional recoding
+      .data$Smoking_pred == "Never Smoker",                                     # If never smoker
+      0,                                                                        # Code as 0
+      ifelse(.data$Smoking_pred == "Former Smoker", 1, 2)                       # Former = 1, Current = 2
+    )                                                                           # End conditional
+  ) %>%                                                                         # Continue pipeline
+  dplyr::mutate(                                                                # Start Recording
+    Smoking_is_imputed = as.numeric(is.na(.data$Smoking)),                      # Record if value is imputed
+    Smoking = ifelse(is.na(.data$Smoking), .data$Smoking_pred, .data$Smoking)   # Replace missing value with imputed value
+  )                                                                             # End mutate
+```
+
+# Impute Education
+
+```{r imp_education}
+imputed_year <- impute_parameter(                                               # Impute missing education years
+  pheno_df, beta, "Education_year", fdr_thresh = 0.01, stat_test = "lm"         # Using methylation-informed imputation
+)                                                                               # Returns imputed values
+
+pheno_df <- pheno_df %>%                                                        # Update phenotype data
+  dplyr::mutate(                                                                # Create imputed education column
+    Education_is_imputed = as.numeric(is.na(.data$Education_year)),             # Note where value was imputed
+    Education_year = ifelse(                                                    # Fill missing values
+      is.na(.data$Education_year),                                              # If education is missing
+      imputed_year,                                                             # Use imputed value
+      .data$Education_year                                                      # Otherwise use observed value
+    )                                                                           # End conditional
+  ) %>%                                                                         # Continue pipeline
+  dplyr::mutate(                                                                # Create education categories
+    Education_category = ifelse(                                                # Start categorization
+      .data$Education_year <= 12,                                               # If 12 years or less
+      "0-12",                                                                   # Category: 0-12 years
+      ifelse(                                                                   # Else if
+        .data$Education_year <= 15,                                             # 13-15 years
+        "13-15",                                                                # Category: 13-15 years
+        "16+"                                                                   # Otherwise: 16+ years
+      )                                                                         # End inner conditional
+    )                                                                           # End categorization
+  )                                                                             # End mutate
+```
+
+# Impute APOE4
+
+```{r imp_apoe4}
+pheno_df <- pheno_df %>%                                                        # Update phenotype data
+  dplyr::mutate(APOE4_status = ifelse(.data$APOE4 >= 1, 1, 0)) %>%              # Create binary APOE4 status (carrier=1)
+  dplyr::mutate(                                                                # Preserve missing values
+    APOE4_status = ifelse(is.na(.data$APOE4), NA, .data$APOE4_status),          # If APOE4 missing, keep as NA
+    APOE4_factor = factor(.data$APOE4_status, levels = c(0,1))                  # Convert to a categorical variable with values of 0 or 1
+  )                                                                             # End mutate
+
+imputed_apoe <- impute_parameter(                                               # Impute missing APOE4 status
+  pheno_df, beta, "APOE4_factor", fdr_thresh = 0.01, stat_test = "glm"          # Using logistic regression
+)                                                                               # Returns imputed binary values
+
+imputed_apoe <- as.numeric(levels(imputed_apoe))[imputed_apoe]                  # Convert the returned factor into a numeric 
+
+pheno_df <- pheno_df %>%                                                        # Update phenotype data
+  dplyr::mutate(                                                                # Record if value is imputed
+    APOE4_is_imputed = as.numeric(is.na(.data$APOE))                            # Note where value was imputed
+  ) %>%                                                                         # Continue pipeline
+  dplyr::mutate(                                                                # Create imputed APOE4 column
+    APOE4_imputed = ifelse(                                                     # Fill missing values
+      is.na(.data$APOE4),                                                       # If APOE4 is missing
+      imputed_apoe,                                                             # Use imputed value
+      .data$APOE4_status                                                        # Otherwise use observed value
+    )                                                                           # End conditional
+  )                                                                             # End mutate
+```
+
+# Filter to Phenotypes of Interest
+
+We Filter to the phenotypes for submission
+
+```{r filter_pheno}
+pheno_df <- pheno_df %>%                                                        # Update phenotype data
+  dplyr::mutate(ID = .data$dbGaP_Sample_ID) %>%                                 # Create ID column
+  dplyr::select(                                                                # Select columns for output
+    "ID",                                                                       # Primary identifier
+    "SAMPLE_ID",                                                                # Sample identifier
+    "SUBJECT_ID",                                                               # Subject identifier
+    "dbGaP_Sample_ID",                                                          # dbGaP sample ID
+    "dbGaP_Subject_ID",                                                         # dbGaP subject ID
+    "shareid",                                                                  # Share identifier
+    "idtype",                                                                   # ID type
+    "Age",                                                                      # Chronological age
+    "Age_pred",                                                                 # Predicted epigenetic age
+    "Sex",                                                                      # Biological sex
+    "Smoking",                                                                  # Observed smoking status
+    "Smoking_is_imputed",                                                       # Observe if smoking status was imputed
+    "Smoking_score",                                                            # Predicted smoking status
+    APOE4 = "APOE4_status",                                                     # APOE4 carrier status (renamed)
+    "APOE4_is_imputed",                                                         # Observe if APOE4 carrier status was imputed
+    Education = "Education_year",                                               # Number of years of education
+    Education_cat = "Education_category",                                       # Education category
+    "Education_is_imputed",                                                     # Observe if Education category was imputed
+    PCA_outlier = "is_outlier",                                                 # PCA outlier flag (renamed)
+    "PC_1",                                                                     # Principal component 1
+    "PC_2",                                                                     # Principal component 2
+    "PC_3",                                                                     # Principal component 3
+    "PC_4",                                                                     # Principal component 4
+    "PC_5"                                                                      # Principal component 5
+  ) %>%                                                                         # End select
+  dplyr::mutate(                                                                # Recode variables to numeric
+    Education_cat = ifelse(                                                     # Recode education categories
+      .data$Education_cat == "0-12",                                            # If 0-12 years
+      0,                                                                        # Code as 0
+      ifelse(.data$Education_cat == "13-15", 1, 2)                              # if 13-15 code as 1, if 16+ code as 2
+    ),                                                                          # End education recoding
+    Sex = ifelse(.data$Sex == "MALE", 0, 1),                                    # Recode sex (0=male, 1=female)
+    Age_pred = round(.data$Age_pred, digits = 1),                               # Round predicted age to 1 decimal
+    PCA_outlier = as.numeric(.data$PCA_outlier)                                 # Convert outlier flag to numeric
+  )                                                                             # End mutate
+
+```
+
+# Save
+
+```{r save}
+write.table(                                                                    # Write phenotype table to file
+  x = pheno_df,                                                                 # Data frame to write
+  file = file.path(submit_dir, "FHS_full_pheno.tsv"),                           # Output file path
+  quote = FALSE,                                                                # Don't quote strings
+  sep = "\t",                                                                   # Tab-separated format
+  row.names = FALSE,                                                            # Don't write row names
+  col.names = TRUE                                                              # Write column names
+)                                                                               # End write.table
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()                                                                   # Print session/package versions for reproducibility
+```
+</details>

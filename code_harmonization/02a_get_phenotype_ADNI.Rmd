@@ -1,0 +1,153 @@
+---
+title: "Read in ADNI DNA methylation data"
+author: 
+  - David lukacsovich^[University of Miami]
+  - Lily Wang^[University of Miami]
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    highlight: pygments
+    theme: yeti
+    toc: true
+    number_sections: true
+    df_print: paged
+    code_download: false
+    toc_float:
+      collapsed: yes
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline    
+---
+
+# Set Up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Libraries
+
+```{r library}
+suppressMessages({
+  library(dplyr)
+  library(tidyr)
+  library(readxl)
+})
+
+base_dir <- "../../.."
+analysis_dir <- file.path(base_dir, "DATASET", "ADNI")
+raw_dir <- file.path(analysis_dir, "DNAm/raw/idat") 
+pheno_dir <- file.path(analysis_dir, "Phenotype", "raw")
+harmony_dir <- file.path(base_dir, "DATASET/_HARMONIZATION/data_CN_only")
+save_dir <- file.path(harmony_dir, "preprocessing/ADNI")
+```
+
+# Get Sample Data
+
+## Read Smaple Barcodes
+
+```{r read_barcode}
+pheno_df <- readxl::read_excel(
+  file.path(pheno_dir, "ADNI_DNA_Methylation_SampleAnnotation_20170530.xlsx")
+) %>%
+  dplyr::mutate(sample = .data$barcodes) %>%
+  dplyr::rename(Batch = "PlateNumber") %>%
+  dplyr::mutate(ID = paste0(.data$RID, "_", .data$Phase, "_", .data$Edate))
+```
+
+## Read Sample Clinical Information
+
+```{r read_clinical}
+clinical_df <- read.csv(file.path(pheno_dir, "ADNIMERGE_downloaded_3-1-2021.csv")) %>%
+  dplyr::mutate(
+    ID = paste0(.data$RID, "_", .data$COLPROT, "_", .data$EXAMDATE)
+  ) %>%
+  dplyr::select(
+    "ID",
+    Age = "AGE",
+    Sex = "PTGENDER",
+    Ethnicity = "PTETHCAT",
+    Race = "PTRACCAT",
+    "APOE4",
+    "DX"
+  ) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(
+    Sex = ifelse(.data$Sex %in% c("M", "Male", "MALE"), "MALE", "FEMALE")
+  )
+```
+
+## Read Age Information
+
+```{r read_age}
+demo_df <- read.csv(file.path(pheno_dir,"PTDEMOG_3-1-2021.csv")) %>%
+  dplyr::select("RID", birth_month = "PTDOBMM", birth_year = "PTDOBYY") %>%
+  dplyr::distinct() %>%
+  dplyr::filter(!is.na(.data$birth_month))
+```
+
+# Get Sample Attributes
+
+## Merge Data Frames
+
+```{r get_merge}
+pheno_df <- pheno_df %>%
+  dplyr::left_join(demo_df, by = "RID") %>%
+  dplyr::left_join(clinical_df, by = "ID")
+```
+
+## Calculate Age at Drawing
+
+```{r get_age}
+pheno_df <- pheno_df %>%
+  dplyr::mutate(
+    age_at_visit = lubridate::interval(
+      as.Date(paste0(.data$birth_month,"/1/",.data$birth_year), "%m/%d/%Y"),
+      .data$DateDrawn
+    ) %>%
+      lubridate::time_length(unit = "years")
+  ) %>%
+  as.data.frame()
+```
+
+# Filter to Target Data
+
+## Filter to First Exam per Person
+
+```{r filter_exam}
+id_ls <- pheno_df %>%
+  dplyr::group_by(.data$RID) %>%
+  dplyr::arrange(.data$Edate) %>%
+  dplyr::filter(dplyr::row_number() == 1) %>%
+  dplyr::ungroup() %>%
+  dplyr::pull("ID")
+pheno_df <- pheno_df %>%
+  dplyr::filter(.data$ID %in% id_ls)
+```
+
+## Filter by Dementia Status
+
+```{r filter_dementia}
+pheno_df <- pheno_df %>%
+  dplyr::filter(!is.na(.data$DX)) %>%
+  dplyr::filter(.data$DX == "CN")
+```
+
+# Save
+
+```{r save}
+write.csv(
+  pheno_df,
+  file = file.path(save_dir, "phenotype_all.csv"),
+  row.names = FALSE
+)
+```
+
+# Session Information
+
+<details>
+  <summary>**Session Info**</summary>
+```{r session}
+sessionInfo()
+```
+</details>
